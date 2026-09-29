@@ -151,6 +151,8 @@ import { AppSidebar } from "./components/AppSidebar";
 
 import type { CollabAPI } from "./collab/Collab";
 
+import { initNotesPanel } from "./notes-panel";
+
 polyfill();
 
 window.EXCALIDRAW_THROTTLE_RENDER = true;
@@ -394,6 +396,13 @@ const ExcalidrawWrapper = () => {
     initialStatePromiseRef.current.promise =
       resolvablePromise<ExcalidrawInitialDataState | null>();
   }
+
+  useEffect(() => {
+    if (excalidrawAPI) {
+      (window as any).notesAPI = excalidrawAPI;
+      initNotesPanel();
+    }
+  }, [excalidrawAPI]);
 
   const debugCanvasRef = useRef<HTMLCanvasElement>(null);
 

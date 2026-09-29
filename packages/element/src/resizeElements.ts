@@ -920,11 +920,22 @@ export const resizeSingleElement = (
     Number.isFinite(newOrigin.x) &&
     Number.isFinite(newOrigin.y)
   ) {
+    let strokeWidthUpdate: { strokeWidth?: number } = {};
+    if (isFreeDrawElement(origElement)) {
+      // scale stroke width by the geometric-mean of the x/y scale, so it
+      // grows proportionally with the stroke (matches how the ink looks bigger)
+      const sx = Math.abs(nextWidth) / origElement.width;
+      const sy = Math.abs(nextHeight) / origElement.height;
+      const s = Math.sqrt(sx * sy);
+      strokeWidthUpdate = { strokeWidth: origElement.strokeWidth * s };
+    }
+
     let updates: ElementUpdate<ExcalidrawElement> = {
       ...newOrigin,
       width: Math.abs(nextWidth),
       height: Math.abs(nextHeight),
       ...rescaledPoints,
+      ...strokeWidthUpdate,
     };
 
     if (isBindingElement(latestElement)) {
@@ -1403,6 +1414,7 @@ export const resizeMultipleElements = (
         startBinding?: ExcalidrawElbowArrowElement["startBinding"];
         endBinding?: ExcalidrawElbowArrowElement["endBinding"];
         fixedSegments?: ExcalidrawElbowArrowElement["fixedSegments"];
+        strokeWidth?: ExcalidrawElement["strokeWidth"];
       };
     }[] = [];
 
@@ -1441,6 +1453,9 @@ export const resizeMultipleElements = (
         height,
         angle,
         ...rescaledPoints,
+        ...(isFreeDrawElement(orig)
+          ? { strokeWidth: orig.strokeWidth * Math.sqrt(scaleX * scaleY) }
+          : {}),
       };
 
       if (isElbowArrow(orig)) {

@@ -537,6 +537,9 @@ const EditorInterfaceContext = React.createContext<EditorInterface>(
 );
 EditorInterfaceContext.displayName = "EditorInterfaceContext";
 
+const SIMULATE_60HZ = new URLSearchParams(location.search).has("sim60");
+let lastInkFrame = 0;
+
 const editorLifecycleEventBehavior = {
   "editor:mount": { cardinality: "once", replay: "last" },
   "editor:initialize": { cardinality: "once", replay: "last" },
@@ -11168,7 +11171,7 @@ class App extends React.Component<AppProps, AppState> {
           return;
         }
 
-        if (newElement.type === "freedraw") {
+        /*if (newElement.type === "freedraw") {
           const points = newElement.points;
           const dx = pointerCoords.x - newElement.x;
           const dy = pointerCoords.y - newElement.y;
@@ -11198,7 +11201,77 @@ class App extends React.Component<AppProps, AppState> {
               newElement,
             });
           }
-        } else if (isLinearElement(newElement) && !newElement.isDeleted) {
+        }*/ 
+        if (newElement.type === "freedraw") {
+          const points = newElement.points;
+
+          const coalesced =
+            typeof event.getCoalescedEvents === "function"
+              ? event.getCoalescedEvents()
+              : null;
+          const samples =
+            coalesced && coalesced.length > 0 ? coalesced : [event];
+
+          const newPoints: LocalPoint[] = [];
+          const newPressures: number[] = [];
+
+          for (const sample of samples) {
+            const sampleCoords = viewportCoordsToSceneCoords(
+              { clientX: sample.clientX, clientY: sample.clientY },
+              this.state,
+            );
+            const dx = sampleCoords.x - newElement.x;
+            const dy = sampleCoords.y - newElement.y;
+
+            const tail =
+              newPoints.length > 0
+                ? newPoints[newPoints.length - 1]
+                : points.length > 0
+                  ? points[points.length - 1]
+                  : false;
+            const discardPoint = tail && tail[0] === dx && tail[1] === dy;
+            if (discardPoint) {
+              continue;
+            }
+
+            newPoints.push(pointFrom<LocalPoint>(dx, dy));
+            if (!newElement.simulatePressure) {
+              newPressures.push(sample.pressure);
+            }
+          }
+
+          if (newPoints.length > 0) {
+            // Always accumulate points into the element...
+            const pressures = newElement.simulatePressure
+              ? newElement.pressures
+              : [...newElement.pressures, ...newPressures];
+
+            // ...but only RENDER at ~60Hz when simulating, so input isn't lost,
+            // only the visual update is delayed (mimics a 60Hz panel's ink lag).
+            const now = performance.now();
+            const throttled = SIMULATE_60HZ && now - lastInkFrame < 16.6;
+
+            this.scene.mutateElement(
+              newElement,
+              {
+                points: [...points, ...newPoints],
+                pressures,
+              },
+              {
+                informMutation: false,
+                isDragging: false,
+              },
+            );
+
+            if (!throttled) {
+              lastInkFrame = now;
+              this.setState({
+                newElement,
+              });
+            }
+          }
+        }
+        else if (isLinearElement(newElement) && !newElement.isDeleted) {
           pointerDownState.drag.hasOccurred = true;
           const points = newElement.points;
 
