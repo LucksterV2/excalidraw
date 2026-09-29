@@ -268,13 +268,33 @@ export function initNotesPanel() {
     inp.click();
   };
 
-  (window as any).setPagePad = (pageIndex: number, top: number, bottom: number) => {
+  (window as any).setPagePad = (pageIndex: number, top: number, bottom: number, left = 0, right = 0) => {
     if (!pdfDoc) return;
     const p = pdfDoc.pages.find(pp => pp.index === pageIndex);
     if (!p) return;
-    p.padTop = top; p.padBottom = bottom;
-    layoutPages(pdfDoc.pages);       // recompute all bands (cascade)
-    pdfDoc.rerender();               // re-render at new positions
+    p.padTop = Math.max(0, top);
+    p.padBottom = Math.max(0, bottom);
+    p.padLeft = Math.max(0, left);      // clamp ≥ 0 (your rule)
+    p.padRight = Math.max(0, right);
+    layoutPages(pdfDoc);          // recompute vertical bands (top/bottom cascade)
+    computeBox(pdfDoc);                 // recompute box dimensions (incl. new width)
+    syncBox();                          // reposition the box div
+    pdfDoc.rerender();                  // re-render pages at new positions
+  };
+}
+
+function computeBox(doc: PdfDoc) {
+  const pages = doc.pages;
+  const widest = Math.max(...pages.map(p => p.pdfW));
+  const maxLeft = Math.max(...pages.map(p => p.padLeft));
+  const maxRight = Math.max(...pages.map(p => p.padRight));
+  const top = pages[0].bandTop;
+  const bottom = pages[pages.length - 1].bandBottom;
+  doc.box = {
+    x: doc.origin.x - maxLeft,
+    y: top,
+    w: maxLeft + widest + maxRight,
+    h: bottom - top,
   };
 }
 
@@ -428,6 +448,7 @@ let pdfLayer: PdfLayer | null = null;
 type PageGeom = {
   pdfW: number; pdfH: number;
   padTop: number; padBottom: number;
+  padLeft: number; padRight: number;
 };
 type LaidPage = PageGeom & {
   index: number;
@@ -440,6 +461,7 @@ type PdfDoc = {
   pdf: any;
   pages: LaidPage[];
   padWidth: number;
+  origin: { x: number; y: number };
   box: { x: number; y: number; w: number; h: number };
   boxEl?: HTMLDivElement;
   rerender: () => Promise<void>;
@@ -448,9 +470,9 @@ type PdfDoc = {
 let pdfDoc: PdfDoc | null = null;
 
 // Recompute each page's world-space band from paddings (the cascade).
-function layoutPages(pages: LaidPage[]) {
-  let y = 0;
-  for (const p of pages) {
+function layoutPages(doc: PdfDoc) {
+  let y = doc.origin.y;
+  for (const p of doc.pages) {
     p.bandTop = y;
     p.pdfTop = y + p.padTop;
     p.pdfBottom = p.pdfTop + p.pdfH;
@@ -480,21 +502,22 @@ async function mountPdf(file: File) {
     el.appendChild(canvas);
     pages.push({
       index: i, pdfW: vp.width, pdfH: vp.height,
-      padTop: 0, padBottom: 0,
+      padTop: 0, padBottom: 0, 
+      padLeft: 0, padRight: 0,
       bandTop: 0, pdfTop: 0, pdfBottom: 0, bandBottom: 0,
       canvas,
     });
   }
-  layoutPages(pages);
 
-  const fullW = Math.max(...pages.map(p => p.pdfW));
-  const fullH = pages[pages.length - 1].bandBottom;
   const doc: PdfDoc = {
     el, pdf, pages, padWidth: 0,
-    box: { x: 0, y: 0, w: fullW, h: fullH },
+    origin: {x: 0, y: 0},
+    box: { x: 0, y: 0, w: 0, h: 0 },   // placeholder, computed next
     rerender: async () => {},
   };
   pdfDoc = doc;
+  layoutPages(doc);   // ensure bands are set (if not already)
+  computeBox(doc);      // derive box from pages + paddings
   createBox(doc);
 
   // render one page's visible slice (reuses your proven single-page logic)
@@ -505,12 +528,14 @@ async function mountPdf(file: File) {
     const worldRight = vw / zoom - scrollX, worldBottom = vh / zoom - scrollY;
     const mX = (worldRight - worldLeft) * 0.5, mY = (worldBottom - worldTop) * 0.5;
 
-    // clip to THIS page's PDF rect (content sits at pdfTop..pdfBottom, x 0..pdfW)
+    // clip to THIS page's PDF rect in world coords
+    const pageLeft = doc.origin.x;
+    const pageRight = pageLeft + p.pdfW;
     const renderScale = zoom;
     const g = 1 / renderScale;
-    const wx = Math.max(0, Math.floor((worldLeft - mX) / g) * g);
+    const wx = Math.max(pageLeft, Math.floor((worldLeft - mX) / g) * g);
     const wy = Math.max(p.pdfTop, Math.floor((worldTop - mY) / g) * g);
-    const wxr = Math.min(p.pdfW, worldRight + mX);
+    const wxr = Math.min(pageRight, worldRight + mX);
     const wyb = Math.min(p.pdfBottom, worldBottom + mY);
     const ww = wxr - wx, wh = wyb - wy;
 
@@ -529,7 +554,7 @@ async function mountPdf(file: File) {
     const page = await doc.pdf.getPage(p.index);
     const vp = page.getViewport({
       scale: renderScale,
-      offsetX: -Math.round(wx * renderScale),
+      offsetX: -Math.round((wx - pageLeft) * renderScale),
       offsetY: -Math.round((wy - p.pdfTop) * renderScale),
     });
 
@@ -617,22 +642,6 @@ function createBox(doc: PdfDoc) {
   const right = mkEdge(`top:0;bottom:0;right:0;width:${edgeThick}px;cursor:move;`);
   [top, bottom, left, right].forEach(e => attachMove(e, doc));
 
-  // 4 corner handles (resize)
-  const corners: Array<[string, "nw"|"ne"|"sw"|"se"]> = [
-    ["left:-7px;top:-7px;cursor:nwse-resize;", "nw"],
-    ["right:-7px;top:-7px;cursor:nesw-resize;", "ne"],
-    ["left:-7px;bottom:-7px;cursor:nesw-resize;", "sw"],
-    ["right:-7px;bottom:-7px;cursor:nwse-resize;", "se"],
-  ];
-  for (const [css, which] of corners) {
-    const h = document.createElement("div");
-    h.style.cssText =
-      `position:absolute; width:${HANDLE}px; height:${HANDLE}px; ` +
-      "background:#4a90d9; border-radius:3px; pointer-events:auto; " + css;
-    box.appendChild(h);
-    attachResize(h, doc, which);
-  }
-
   document.body.appendChild(box);
   doc.boxEl = box;
   syncBox();
@@ -677,27 +686,14 @@ function dragWithShield(onMove: (dxWorld: number, dyWorld: number) => void) {
 
 function attachMove(el: HTMLElement, doc: PdfDoc) {
   el.addEventListener("pointerdown", (e) => {
-    const start = { ...doc.box };  // capture ONCE at drag start
+    const start = { ...doc.origin };
     dragWithShield((dx, dy) => {
-      doc.box.x = start.x + dx;
-      doc.box.y = start.y + dy;
+      doc.origin.x = start.x + dx;
+      doc.origin.y = start.y + dy;
+      layoutPages(doc);
+      computeBox(doc);
       syncBox();
+      doc.rerender();   // ← re-render pages at new positions (not just syncPdf)
     })(e as PointerEvent);
-  });
-}
-
-function attachResize(el: HTMLElement, doc: PdfDoc, which: "nw"|"ne"|"sw"|"se") {
-  el.addEventListener("pointerdown", (e) => {
-    const start = { ...doc.box };
-    dragWithShield((dx, dy) => {
-      let { x, y, w, h } = start;
-      if (which === "se") { w = start.w + dx; h = start.h + dy; }
-      if (which === "sw") { x = start.x + dx; w = start.w - dx; h = start.h + dy; }
-      if (which === "ne") { y = start.y + dy; w = start.w + dx; h = start.h - dy; }
-      if (which === "nw") { x = start.x + dx; y = start.y + dy; w = start.w - dx; h = start.h - dy; }
-      doc.box.x = x; doc.box.y = y;
-      doc.box.w = Math.max(20, w); doc.box.h = Math.max(20, h);
-      syncBox();
-    })(e);
   });
 }
