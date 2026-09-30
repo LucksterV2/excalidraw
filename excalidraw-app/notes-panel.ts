@@ -252,6 +252,44 @@ export function initNotesPanel() {
     });
   }
 
+    // keep bound strokes' page-local offset in sync when user moves/edits them
+  if (mainApi?.onChange) {
+    let syncing = false;
+    mainApi.onChange(() => {
+      if (!pdfDoc || syncing) return;
+      const doc = pdfDoc;
+      const pageById = new Map(doc.pages.map(p => [p.index, p]));
+      const els = mainApi.getSceneElements();
+      let needsUpdate = false;
+
+      const updated = els.map((e: any) => {
+        const cd = e.customData;
+        if (cd?.page === undefined || cd.pageX === undefined) return e;
+        const p = pageById.get(cd.page);
+        if (!p) return e;
+        // what canvas pos SHOULD be, given current offset + page position
+        const expectedX = doc.origin.x + cd.pageX;
+        const expectedY = p.bandTop + cd.pageY;
+        // if actual differs (user moved it), re-derive the offset
+        if (Math.abs(e.x - expectedX) > 0.01 || Math.abs(e.y - expectedY) > 0.01) {
+          needsUpdate = true;
+          return { ...e, customData: {
+            ...cd,
+            pageX: e.x - doc.origin.x,
+            pageY: e.y - p.bandTop,
+          } };
+        }
+        return e;
+      });
+
+      if (needsUpdate) {
+        syncing = true;
+        mainApi.updateScene({ elements: updated });
+        syncing = false;
+      }
+    });
+  }
+
 
 
   //PDF SUPPORT
@@ -701,9 +739,24 @@ function attachMove(el: HTMLElement, doc: PdfDoc) {
       doc.origin.y = start.y + dy;
       layoutPages(doc);
       computeBox(doc);
+      repositionBoundStrokes(doc)
       syncBox();
       doc.rerender();   // ← re-render pages at new positions (not just syncPdf)
     })(e as PointerEvent);
+  });
+}
+
+function repositionBoundStrokes(doc: PdfDoc) {
+  const api = (window as any).notesAPI;
+  const pageById = new Map(doc.pages.map(p => [p.index, p]));
+  api.updateScene({
+    elements: api.getSceneElements().map((e: any) => {
+      const cd = e.customData;
+      if (cd?.page === undefined || cd.pageX === undefined) return e;
+      const p = pageById.get(cd.page);
+      if (!p) return e;
+      return { ...e, x: doc.origin.x + cd.pageX, y: p.bandTop + cd.pageY };
+    }),
   });
 }
 
@@ -752,10 +805,15 @@ function classifyStroke(el: any) {
 
   // tag the stroke with its page (page-local coords stored for later move/hide)
   const api = (window as any).notesAPI;
-  api.updateScene({
+    api.updateScene({
     elements: api.getSceneElements().map((e: any) =>
       e.id === el.id
-        ? { ...e, customData: { ...e.customData, page: page.index } }
+        ? { ...e, customData: {
+            ...e.customData,
+            page: page.index,
+            pageX: el.x - doc.origin.x,        // offset from page's x-origin
+            pageY: el.y - page.bandTop,        // offset from page's band top
+          } }
         : e),
   });
 
