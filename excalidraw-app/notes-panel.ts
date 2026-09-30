@@ -125,6 +125,7 @@ export function initNotesPanel() {
     <button id="np-load"   title="Load">📂</button>
     <button id="np-target" title="Set target">🎯</button>
     <button id="np-link"   title="Link to target">🔗</button>
+    <button id="np-pdf"    title="Add PDF">📎</button>
     <button id="np-mode"   title="Toggle full/page mode">📄</button>
     <button id="np-prev"   title="Previous page">◀</button>
     <button id="np-next"   title="Next page">▶</button>
@@ -285,7 +286,12 @@ export function initNotesPanel() {
   panel.querySelector("#np-load")!.addEventListener("click", openLoadDialog);
   panel.querySelector("#np-target")!.addEventListener("click", doSetTarget);
   panel.querySelector("#np-link")!.addEventListener("click", doLink);
-
+  panel.querySelector("#np-pdf")!.addEventListener("click", () => {
+    const inp = document.createElement("input");
+    inp.type = "file"; inp.accept = "application/pdf";
+    inp.onchange = () => inp.files && mountPdf(inp.files[0]).catch(e => { console.error(e); toast("PDF load failed"); });
+    inp.click();
+  });
   
   const toggleBtn = panel.querySelector("#np-toggle") as HTMLButtonElement;
   toggleBtn.addEventListener("click", () => {
@@ -326,7 +332,6 @@ export function initNotesPanel() {
     pdfDoc.scrollOffset = Math.max(0, (pdfDoc.scrollOffset || 0) + e.deltaY / z);
     pdfDoc.rerender();
     applyScrollInk(pdfDoc);
-    pdfDoc.rerender();
   }, { capture: true, passive: false });
 
   document.addEventListener("pointermove", (e) => {
@@ -418,7 +423,6 @@ export function initNotesPanel() {
     });
   }
 
-  //(window as any).mountPdfLayer = mountPdf;
   (window as any).loadPdf = () => {
     const inp = document.createElement("input");
     inp.type = "file"; inp.accept = "application/pdf";
@@ -598,20 +602,6 @@ export async function openNotePopup(noteName: string, targetIds: string[] = []) 
 }
 
 //PDF SUPPORT
-// ---- Crisp PDF underlay ----
-type PdfLayer = {
-  el: HTMLDivElement;
-  canvas: HTMLCanvasElement;
-  pdf: any;
-  pageNum: number;
-  pageW: number;
-  pageH: number;
-  rerender: () => Promise<void>;
-  _patch?: { wx: number; wy: number; ww: number; wh: number; scale: number };
-};
-
-let pdfLayer: PdfLayer | null = null;
-
 // ---- Multi-page crisp PDF underlay ----
 type PageGeom = {
   pdfW: number; pdfH: number;
@@ -924,11 +914,12 @@ function repositionBoundStrokes(doc: PdfDoc) {
 function classifyStroke(el: any) {
   if (!pdfDoc || el.type !== "freedraw") return;
   const doc = pdfDoc;
+  const off = doc.mode === "scroll" ? (doc.scrollOffset || 0) : 0;
 
   const startX = el.x;
-  const startY = el.y;
+  const startY = el.y + off;   // ← unscroll: true world Y for page lookup + box test
 
-  if (!pointInBox(doc, startX, startY)) return; // free stroke
+  if (!pointInBox(doc, startX, startY)) return;
 
   const page = pageAtWorldY(doc, startY);
   if (!page) return;
@@ -972,11 +963,13 @@ function classifyStroke(el: any) {
         ? { ...e, customData: {
             ...e.customData,
             page: page.index,
-            pageX: el.x - doc.origin.x,   // offset from CENTER origin (consistent now)
-            pageY: el.y - page.bandTop,
+            pageX: el.x - doc.origin.x,
+            pageY: (el.y + off) - page.bandTop, 
           } }
         : e),
   });
+
+  if (doc.mode === "scroll") applyScrollInk(doc);
 }
 
 // Which page's band contains a given world Y? Returns the page or null.
