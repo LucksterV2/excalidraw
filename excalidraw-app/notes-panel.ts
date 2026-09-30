@@ -319,12 +319,13 @@ export function initNotesPanel() {
     const wy = e.clientY / z - st.scrollY;
     const w = pdfDoc.scrollWindow;
     const inside = wx >= w.x && wx <= w.x + w.w && wy >= w.y && wy <= w.y + w.h;
-    console.log("wheel:", { wx: wx.toFixed(0), wy: wy.toFixed(0), win: w, inside });
     if (!inside) return;
     e.preventDefault();
     e.stopPropagation();
     (e as any).stopImmediatePropagation?.();
     pdfDoc.scrollOffset = Math.max(0, (pdfDoc.scrollOffset || 0) + e.deltaY / z);
+    pdfDoc.rerender();
+    applyScrollInk(pdfDoc);
     pdfDoc.rerender();
   }, { capture: true, passive: false });
 
@@ -362,7 +363,7 @@ export function initNotesPanel() {
   if (mainApi?.onChange) {
     let syncing = false;
     mainApi.onChange(() => {
-      if (!pdfDoc || syncing) return;
+      if (!pdfDoc || syncing || pdfDoc.mode === "scroll") return;
       const doc = pdfDoc;
       const pageById = new Map(doc.pages.map(p => [p.index, p]));
       const els = mainApi.getSceneElements();
@@ -995,15 +996,9 @@ function pointInBox(doc: PdfDoc, wx: number, wy: number): boolean {
 function setMode(doc: PdfDoc, mode: "full" | "page" | "scroll") {
   doc.mode = mode;
   if (mode === "scroll" && !doc.scrollWindow) {
-    // default window: page-width, ~60% page-height, near the top
     const pw = Math.max(...doc.pages.map(p => p.pdfW));
     const ph = doc.pages[0].pdfH;
-    doc.scrollWindow = {
-      x: doc.origin.x - pw / 2,
-      y: doc.origin.y,
-      w: pw,
-      h: ph * 0.6,
-    };
+    doc.scrollWindow = { x: doc.origin.x - pw / 2, y: doc.origin.y, w: pw, h: ph * 0.6 };
     doc.scrollOffset = 0;
   }
   layoutPages(doc);
@@ -1012,6 +1007,7 @@ function setMode(doc: PdfDoc, mode: "full" | "page" | "scroll") {
   syncBox();
   doc.rerender();
   applyScrollClip(doc);
+  if (mode === "scroll") applyScrollInk(doc);   // ← moved here, AFTER layout
   if (mode === "page") {
     const api = (window as any).notesAPI;
     const st = api.getAppState();
@@ -1055,7 +1051,7 @@ function applyStrokeVisibility(doc: PdfDoc) {
   const visible: any[] = [];
   const hidden: any[] = [];
   for (const e of allBound) {
-    const shouldShow = doc.mode === "full" || e.customData.page === doc.currentPage;
+    const shouldShow = doc.mode === "full" || doc.mode === "scroll" || e.customData.page === doc.currentPage;
     (shouldShow ? visible : hidden).push(e);
   }
 
@@ -1269,4 +1265,36 @@ function applyScrollClip(doc: PdfDoc) {
   const sw = w.w * z, sh = w.h * z;
   // clip the pdf-layer to the window's screen rect
   doc.el.style.clipPath = `inset(${sy}px calc(100% - ${sx + sw}px) calc(100% - ${sy + sh}px) ${sx}px)`;
+}
+
+function applyScrollInk(doc: PdfDoc) {
+  if (doc.mode !== "scroll" || !doc.scrollWindow) return;
+  const api = (window as any).notesAPI;
+  const off = doc.scrollOffset || 0;
+  const w = doc.scrollWindow;
+  const pageById = new Map(doc.pages.map(p => [p.index, p]));
+
+  const inScene = api.getSceneElements();
+  const bound = inScene.filter((e: any) => e.customData?.page !== undefined);
+  const free  = inScene.filter((e: any) => e.customData?.page === undefined);
+  const pool = [...bound, ...strokeStash];
+
+  const visible: any[] = [];
+  const hidden: any[] = [];
+  for (const e of pool) {
+    const p = pageById.get(e.customData.page);
+    if (!p) { hidden.push(e); continue; }
+    // stroke's scroll-mode world position (shifted up by offset, like the PDF)
+    const wy = p.bandTop + e.customData.pageY - off;
+    const wx = doc.origin.x + e.customData.pageX;
+    // visible only if within the window's world Y-range (rough: use stroke top)
+    const inWindow = wy >= w.y && wy <= w.y + w.h;
+    if (inWindow) {
+      visible.push({ ...e, x: wx, y: wy });
+    } else {
+      hidden.push(e);
+    }
+  }
+  strokeStash = hidden;
+  api.updateScene({ elements: [...free, ...visible] });
 }
