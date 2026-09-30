@@ -231,11 +231,20 @@ export function initNotesPanel() {
   // detect clicks on linked strokes
   const mainApi = (window as any).notesAPI;
   if (mainApi?.onPointerUp) {
-        mainApi.onPointerUp((activeTool: any, _state: any, _event: any) => {
+    mainApi.onPointerUp((activeTool: any, _state: any, _event: any) => {
+      // --- classify a just-drawn stroke ---
+      const els = mainApi.getSceneElements();
+      const last = els[els.length - 1];
+      if (last && last.type === "freedraw" && last.customData?.page === undefined) {
+        // only classify if it was just drawn (freedraw tool active, or just finished)
+        classifyStroke(last);
+      }
+
+      // --- existing link-click detection ---
       const appState = mainApi.getAppState();
       const selectedIds = Object.keys(appState.selectedElementIds || {});
-      if (selectedIds.length !== 1) return; // only act on a single selected stroke
-      const el = mainApi.getSceneElements().find((e: any) => e.id === selectedIds[0]);
+      if (selectedIds.length !== 1) return;
+      const el = els.find((e: any) => e.id === selectedIds[0]);
       const link = el?.customData?.noteLink;
       if (link) {
         (window as any).openNotePopup?.(link.note, link.ids || []);
@@ -697,3 +706,73 @@ function attachMove(el: HTMLElement, doc: PdfDoc) {
     })(e as PointerEvent);
   });
 }
+
+function classifyStroke(el: any) {
+  if (!pdfDoc || el.type !== "freedraw") return;
+  const doc = pdfDoc;
+
+  // start point in world coords (element x/y is the stroke's origin; points[0] is 0,0)
+  const startX = el.x;
+  const startY = el.y;
+
+  // must start inside the box to be page-bound
+  if (!pointInBox(doc, startX, startY)) return; // free stroke, leave untagged
+
+  const page = pageAtWorldY(doc, startY);
+  if (!page) return;
+
+  // stroke's world bounding box (element x/y + width/height)
+  const strokeLeft = el.x;
+  const strokeRight = el.x + el.width;
+
+  // page's current world horizontal extent
+  const pageLeft = doc.origin.x;
+  const pageRight = doc.origin.x + page.pdfW + page.padRight;
+  const pageLeftEdge = doc.origin.x - page.padLeft;
+
+  // auto-extend right if the stroke runs past the right edge
+  const extraMargin = el.height; // ~one line-height, so next letter fits
+  let extended = false;
+  if (strokeRight > pageRight) {
+    page.padRight += (strokeRight - pageRight) + extraMargin;
+    extended = true;
+  }
+  // auto-extend left if it runs past the left edge
+  if (strokeLeft < pageLeftEdge) {
+    page.padLeft += (pageLeftEdge - strokeLeft) + extraMargin;
+    extended = true;
+  }
+
+  if (extended) {
+    layoutPages(doc);
+    computeBox(doc);
+    syncBox();
+    doc.rerender();
+  }
+
+  // tag the stroke with its page (page-local coords stored for later move/hide)
+  const api = (window as any).notesAPI;
+  api.updateScene({
+    elements: api.getSceneElements().map((e: any) =>
+      e.id === el.id
+        ? { ...e, customData: { ...e.customData, page: page.index } }
+        : e),
+  });
+
+  console.log(`stroke bound to page ${page.index}${extended ? " (extended)" : ""}`);
+}
+
+// Which page's band contains a given world Y? Returns the page or null.
+function pageAtWorldY(doc: PdfDoc, worldY: number): LaidPage | null {
+  for (const p of doc.pages) {
+    if (worldY >= p.bandTop && worldY <= p.bandBottom) return p;
+  }
+  return null;
+}
+
+// Is a world point inside the current box?
+function pointInBox(doc: PdfDoc, wx: number, wy: number): boolean {
+  const b = doc.box;
+  return wx >= b.x && wx <= b.x + b.w && wy >= b.y && wy <= b.y + b.h;
+}
+
