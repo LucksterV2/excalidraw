@@ -18,9 +18,33 @@ const API_BASE = import.meta.env.DEV ? "https://notes.nodanio.dk" : "";
 
 async function saveNote(name: string) {
   const api = (window as any).notesAPI;
+
+  // if a PDF is loaded, ensure it's uploaded and capture its state
+  let pdfState: any = null;
+  if (pdfDoc) {
+    // upload the PDF bytes (dedupe means this is cheap if already stored)
+    const hash = await ensurePdfUploaded(pdfDoc);
+    pdfState = {
+      hash,
+      origin: pdfDoc.origin,
+      mode: pdfDoc.mode,
+      currentPage: pdfDoc.currentPage,
+      // per-page paddings (the only per-page state that isn't derivable)
+      pages: pdfDoc.pages.map(p => ({
+        index: p.index,
+        padTop: p.padTop, padBottom: p.padBottom,
+        padLeft: p.padLeft, padRight: p.padRight,
+      })),
+    };
+  }
+
+  // include stashed strokes so page-mode saves don't drop hidden ink
+  const elements = [...api.getSceneElements(), ...strokeStash];
+
   const scene = {
-    elements: api.getSceneElements(),
+    elements,
     appState: { viewBackgroundColor: api.getAppState().viewBackgroundColor },
+    pdf: pdfState,   // ← new: PDF reference + layout
   };
   const res = await fetch(API_BASE + "/save.php", {
     method: "POST",
@@ -30,20 +54,56 @@ async function saveNote(name: string) {
   return res.json();
 }
 
+async function ensurePdfUploaded(doc: PdfDoc): Promise<string> {
+  const res = await fetch(API_BASE + "/docsave.php", {
+    method: "POST", headers: { "Content-Type": "application/pdf" },
+    body: doc.bytes,
+  });
+  const out = await res.json();
+  return out.hash;
+}
+
 async function loadNote(name: string) {
   const api = (window as any).notesAPI;
+  strokeStash = [];
   const res = await fetch(API_BASE + "/load.php?name=" + encodeURIComponent(name));
   if (!res.ok) throw new Error("load failed: " + res.status);
   const scene = await res.json();
+
+  if (scene.pdf) {
+    // note HAS a pdf → mount it and restore layout
+    await mountPdfFromHash(scene.pdf.hash);
+    if (pdfDoc) {
+      pdfDoc.origin = scene.pdf.origin;
+      pdfDoc.mode = scene.pdf.mode;
+      pdfDoc.currentPage = scene.pdf.currentPage;
+      const byIndex = new Map(scene.pdf.pages.map((sp: any) => [sp.index, sp]));
+      for (const p of pdfDoc.pages) {
+        const sp: any = byIndex.get(p.index);
+        if (sp) { p.padTop = sp.padTop; p.padBottom = sp.padBottom; p.padLeft = sp.padLeft; p.padRight = sp.padRight; }
+      }
+      layoutPages(pdfDoc);
+      computeBox(pdfDoc);
+      syncBox();
+      await pdfDoc.rerender();
+    }
+  } else {
+    // note has NO pdf → tear down any existing one
+    if (pdfDoc) {
+      pdfDoc.el.remove();
+      pdfDoc.boxEl?.remove();
+      pdfDoc = null;
+    }
+  }
+
+  // restore elements (includes bound strokes + free strokes)
   api.updateScene({
     elements: scene.elements,
     appState: { ...api.getAppState(), ...scene.appState },
   });
-  try {
-    api.setViewport({ target: api.getSceneElements(), fit: "scale-down", animation: false });
-  } catch (e) {
-    console.warn("setViewport skipped:", e);
-  }
+
+  // re-apply stroke visibility for the restored mode (stash hidden pages)
+  if (pdfDoc) applyStrokeVisibility(pdfDoc);
 }
 
 async function searchNotes(q: string) {
@@ -540,8 +600,9 @@ type PdfDoc = {
   origin: { x: number; y: number };
   box: { x: number; y: number; w: number; h: number };
   boxEl?: HTMLDivElement;
-  mode: "full" | "page";            // ← add (scroll comes later)
-  currentPage: number;              // ← which page shows in page-mode
+  mode: "full" | "page";
+  currentPage: number;
+  bytes?: ArrayBuffer;
   rerender: () => Promise<void>;
 };
 
@@ -572,10 +633,18 @@ function layoutPages(doc: PdfDoc) {
 }
 
 async function mountPdf(file: File) {
-  if (pdfDoc) { pdfDoc.el.remove(); pdfDoc = null; }
-
   const buf = await file.arrayBuffer();
-  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  await mountPdfFromBuffer(buf);
+}
+
+async function mountPdfFromBuffer(buf: ArrayBuffer) {
+  if (pdfDoc) {
+    pdfDoc.el.remove();
+    pdfDoc.boxEl?.remove();
+    pdfDoc = null;
+  }
+
+  const pdf = await pdfjsLib.getDocument({ data: buf.slice(0) }).promise;
 
   const el = document.createElement("div");
   el.id = "pdf-layer";
@@ -592,7 +661,7 @@ async function mountPdf(file: File) {
     el.appendChild(canvas);
     pages.push({
       index: i, pdfW: vp.width, pdfH: vp.height,
-      padTop: 0, padBottom: 0, 
+      padTop: 0, padBottom: 0,
       padLeft: 0, padRight: 0,
       bandTop: 0, pdfTop: 0, pdfBottom: 0, bandBottom: 0,
       canvas,
@@ -601,25 +670,23 @@ async function mountPdf(file: File) {
 
   const doc: PdfDoc = {
     el, pdf, pages, padWidth: 0,
-    origin: {x: 0, y: 0},
-    box: { x: 0, y: 0, w: 0, h: 0 },   // placeholder, computed next
+    origin: { x: 0, y: 0 },
+    box: { x: 0, y: 0, w: 0, h: 0 },
     mode: "full", currentPage: 1,
+    bytes: buf,                        // ← store original bytes for upload
     rerender: async () => {},
   };
   pdfDoc = doc;
-  layoutPages(doc);   // ensure bands are set (if not already)
-  computeBox(doc);      // derive box from pages + paddings
+  layoutPages(doc);
+  computeBox(doc);
   createBox(doc);
 
-  // render one page's visible slice (reuses your proven single-page logic)
   const renderPage = async (p: LaidPage, zoom: number, scrollX: number, scrollY: number) => {
     const vw = window.innerWidth, vh = window.innerHeight;
-    // visible world rect
     const worldLeft = -scrollX, worldTop = -scrollY;
     const worldRight = vw / zoom - scrollX, worldBottom = vh / zoom - scrollY;
     const mX = (worldRight - worldLeft) * 0.5, mY = (worldBottom - worldTop) * 0.5;
 
-    // clip to THIS page's PDF rect in world coords
     const pageLeft = doc.origin.x - p.pdfW / 2;
     const pageRight = doc.origin.x + p.pdfW / 2;
     const renderScale = zoom;
@@ -630,11 +697,10 @@ async function mountPdf(file: File) {
     const wyb = Math.min(p.pdfBottom, worldBottom + mY);
     const ww = wxr - wx, wh = wyb - wy;
 
-    if (ww <= 0 || wh <= 0) { p.canvas.style.display = "none"; return; } // page off-screen
+    if (ww <= 0 || wh <= 0) { p.canvas.style.display = "none"; return; }
     p.canvas.style.display = "";
 
-    // skip if unchanged
-    const sizeTol = Math.max(ww, wh) * 0.1; // 10% extent change before re-render
+    const sizeTol = Math.max(ww, wh) * 0.1;
     if (p._patch && p.canvas.style.display !== "none" &&
         Math.abs(p._patch.wx - wx) < g &&
         Math.abs(p._patch.wy - wy) < g &&
@@ -652,14 +718,12 @@ async function mountPdf(file: File) {
     const pxW = Math.ceil(ww * renderScale);
     const pxH = Math.ceil(wh * renderScale);
 
-    // render into an OFFSCREEN canvas first (never shows a blank frame)
     const off = document.createElement("canvas");
     off.width = pxW;
     off.height = pxH;
     const offCtx = off.getContext("2d")!;
     await page.render({ canvas: off, canvasContext: offCtx, viewport: vp } as any).promise;
 
-    // now swap the finished pixels onto the visible canvas in one shot
     p.canvas.width = pxW;
     p.canvas.height = pxH;
     p.canvas.style.width = (pxW / renderScale) + "px";
@@ -668,7 +732,6 @@ async function mountPdf(file: File) {
     ctx.drawImage(off, 0, 0);
     p._patch = { wx, wy, ww, wh, scale: renderScale };
 
-    // position THIS canvas immediately, same frame as the content swap
     const st2 = (window as any).notesAPI.getAppState();
     const z = st2.zoom.value;
     const sx = Math.round((wx + st2.scrollX) * z);
@@ -681,7 +744,7 @@ async function mountPdf(file: File) {
     const zoom = st.zoom.value;
     for (const p of doc.pages) {
       if (doc.mode === "page" && p.index !== doc.currentPage) {
-        p.canvas.style.display = "none";   // hide non-current pages
+        p.canvas.style.display = "none";
         continue;
       }
       await renderPage(p, zoom, st.scrollX, st.scrollY);
@@ -692,6 +755,13 @@ async function mountPdf(file: File) {
   await doc.rerender();
   syncPdf();
   (window as any).notesAPI.updateScene({ appState: { viewBackgroundColor: "transparent" } });
+}
+
+async function mountPdfFromHash(hash: string) {
+  const res = await fetch(API_BASE + "/docload.php?hash=" + hash);
+  if (!res.ok) throw new Error("pdf fetch failed");
+  const buf = await res.arrayBuffer();
+  await mountPdfFromBuffer(buf);
 }
 
 // position every page canvas to match Excalidraw pan/zoom
