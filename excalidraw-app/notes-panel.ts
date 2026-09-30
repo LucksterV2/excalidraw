@@ -845,10 +845,6 @@ function classifyStroke(el: any) {
     extended = true;
   }
 
-  console.log("L=" + leftWorldX.toFixed(0) + " R=" + rightWorldX.toFixed(0) +
-    " cL=" + contentLeft.toFixed(0) + " cR=" + contentRight.toFixed(0) +
-    " boxL=" + doc.box.x.toFixed(0) + " padL=" + page.padLeft.toFixed(0) + " ext=" + extended);
-
   if (extended) {
     layoutPages(doc);
     computeBox(doc);
@@ -888,24 +884,64 @@ function setMode(doc: PdfDoc, mode: "full" | "page") {
   doc.mode = mode;
   layoutPages(doc);
   computeBox(doc);
+  applyStrokeVisibility(doc);
   syncBox();
   doc.rerender();
-  if (mode === "page") {
-    // snap camera to the slot once
-    const cur = doc.pages.find(p => p.index === doc.currentPage) || doc.pages[0];
+    if (mode === "page") {
     const api = (window as any).notesAPI;
-    api.setViewport({
-      target: [{ x: doc.box.x, y: doc.box.y, width: doc.box.w, height: doc.box.h } as any],
-      fit: "scale-down", animation: true,
-    });
+    const st = api.getAppState();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const b = doc.box;
+    // zoom to fit the box with a margin (0.9 = leave 10% padding)
+    const zoom = Math.min(vw / b.w, vh / b.h) * 0.9;
+    // center the box: scroll so box center maps to screen center
+    // screen_center = (world + scroll) * zoom  →  scroll = screen_center/zoom - world_center
+    const scrollX = (vw / 2) / zoom - (b.x + b.w / 2);
+    const scrollY = (vh / 2) / zoom - (b.y + b.h / 2);
+    api.updateScene({ appState: { ...st, scrollX, scrollY, zoom: { value: zoom } } });
   }
 }
 
 function goToPage(doc: PdfDoc, index: number) {
   doc.currentPage = Math.max(1, Math.min(doc.pages.length, index));
-  layoutPages(doc);   // (harmless in page-mode; keeps things consistent)
+  layoutPages(doc);
   computeBox(doc);
+  applyStrokeVisibility(doc); 
   syncBox();
   doc.rerender();
-  // no camera move on flip (per your decision)
+}
+
+
+
+
+let strokeStash: any[] = [];   // bound strokes currently hidden (out of scene)
+
+function applyStrokeVisibility(doc: PdfDoc) {
+  const api = (window as any).notesAPI;
+  const pageById = new Map(doc.pages.map(p => [p.index, p]));
+
+  // 1. pool: all bound strokes, whether in-scene or stashed
+  const inScene = api.getSceneElements();
+  const boundInScene = inScene.filter((e: any) => e.customData?.page !== undefined);
+  const freeInScene  = inScene.filter((e: any) => e.customData?.page === undefined);
+  const allBound = [...boundInScene, ...strokeStash];
+
+  // 2. decide visible vs hidden
+  const visible: any[] = [];
+  const hidden: any[] = [];
+  for (const e of allBound) {
+    const shouldShow = doc.mode === "full" || e.customData.page === doc.currentPage;
+    (shouldShow ? visible : hidden).push(e);
+  }
+
+  // 3. reposition visible strokes to their page's current position (slot in page-mode)
+  const repositioned = visible.map((e: any) => {
+    const p = pageById.get(e.customData.page);
+    if (!p) return e;
+    return { ...e, x: doc.origin.x + e.customData.pageX, y: p.bandTop + e.customData.pageY };
+  });
+
+  strokeStash = hidden;   // stash the rest
+  // scene = free strokes + visible bound strokes (hidden ones are OUT)
+  api.updateScene({ elements: [...freeInScene, ...repositioned] });
 }
