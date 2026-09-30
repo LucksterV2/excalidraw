@@ -88,12 +88,15 @@ async function loadNote(name: string) {
       await pdfDoc.rerender();
     }
   } else {
-    // note has NO pdf → tear down any existing one
     if (pdfDoc) {
       pdfDoc.el.remove();
       pdfDoc.boxEl?.remove();
       pdfDoc = null;
     }
+    padDragging = false;
+    if (padHandle) { padHandle.remove(); padHandle = null; }
+    padHandleTarget = null;
+    if (sepLayer) { sepLayer.remove(); sepLayer = null; }
   }
 
   // restore elements (includes bound strokes + free strokes)
@@ -305,6 +308,10 @@ export function initNotesPanel() {
     toast(`page ${pdfDoc.currentPage}`);
   });
 
+  document.addEventListener("pointermove", (e) => {
+    if (!padDragging) updatePadHandle(e.clientX, e.clientY);
+  });
+
   (window as any).openNotePopup = openNotePopup;
 
   // detect clicks on linked strokes
@@ -377,6 +384,10 @@ export function initNotesPanel() {
     mainApi.onScrollChange(() => {
       syncPdf();
       syncBox();
+      if (padHandleTarget && !padDragging) {
+        const st2 = mainApi.getAppState();
+        showPadHandleAt(pdfDoc!, padHandleTarget.page, padHandleTarget.side, st2.zoom.value, st2);
+      }
       const now = performance.now();
       if (now - lastRenderTime > 100) {   // throttle: render at most every 100ms while scrolling
         lastRenderTime = now;
@@ -643,6 +654,11 @@ async function mountPdfFromBuffer(buf: ArrayBuffer) {
     pdfDoc.boxEl?.remove();
     pdfDoc = null;
   }
+  // clear the padding handle from any previous document
+  padDragging = false;
+  if (padHandle) { padHandle.remove(); padHandle = null; }
+  padHandleTarget = null;
+  if (sepLayer) { sepLayer.remove(); sepLayer = null; }
 
   const pdf = await pdfjsLib.getDocument({ data: buf.slice(0) }).promise;
 
@@ -775,6 +791,7 @@ function syncPdf() {
     const sy = Math.round((p._patch.wy + st.scrollY) * zoom);
     p.canvas.style.transform = `translate(${sx}px, ${sy}px) scale(${zoom})`;
   }
+  drawSeparators(pdfDoc);
 }
 
 // debounced crispen after motion stops
@@ -1014,4 +1031,188 @@ function applyStrokeVisibility(doc: PdfDoc) {
   strokeStash = hidden;   // stash the rest
   // scene = free strokes + visible bound strokes (hidden ones are OUT)
   api.updateScene({ elements: [...freeInScene, ...repositioned] });
+}
+
+// ---- Single reassigned padding handle ----
+let padHandle: HTMLDivElement | null = null;
+let padHandleTarget: { page: LaidPage; side: "top" | "bottom" | "left" | "right" } | null = null;
+let padDragging = false;
+
+function ensurePadHandle() {
+  if (padHandle) return padHandle;
+  const h = document.createElement("div");
+  h.id = "pad-handle";
+  h.style.cssText =
+    "position:fixed; z-index:160; background:#e8873a; border-radius:3px; " +
+    "pointer-events:auto; display:none; box-shadow:0 1px 4px rgba(0,0,0,.3);";
+  document.body.appendChild(h);
+  h.addEventListener("pointerdown", startPadDrag);
+  padHandle = h;
+  return h;
+}
+
+function hidePadHandle() {
+  if (padHandle && !padDragging) { padHandle.style.display = "none"; padHandleTarget = null; }
+}
+
+// find nearest inside-edge under the pointer, show/position the handle there
+// show handles for the page(s) near the pointer; top/bottom inset inward
+const INSET = 16; // screen px inset for top/bottom handles
+
+function updatePadHandle(clientX: number, clientY: number) {
+  if (!pdfDoc || padDragging) return;
+  const doc = pdfDoc;
+  const st = (window as any).notesAPI.getAppState();
+  const z = st.zoom.value;
+  const wx = clientX / z - st.scrollX;
+  const wy = clientY / z - st.scrollY;
+  const bandPx = 24 / z;
+  const insetW = INSET / z;
+
+  const pages = doc.mode === "page"
+    ? doc.pages.filter(p => p.index === doc.currentPage)
+    : doc.pages;
+
+  // gather candidate (page, side, world edge position) with the handle INSET inward
+  let best: { p: LaidPage; side: "top"|"bottom"|"left"|"right"; dist: number } | null = null;
+  for (const p of pages) {
+    const left = doc.origin.x - p.pdfW / 2 - p.padLeft;
+    const right = doc.origin.x + p.pdfW / 2 + p.padRight;
+    if (wx < left - bandPx || wx > right + bandPx) continue;
+    if (wy < p.bandTop - bandPx || wy > p.bandBottom + bandPx) continue;
+
+    // top/bottom handle sit INSET inward from the band edge
+    const topHandleY = p.bandTop + insetW;
+    const botHandleY = p.bandBottom - insetW;
+    const cand: Array<["top"|"bottom"|"left"|"right", number, number, number]> = [
+      ["top",    doc.origin.x, topHandleY, Math.hypot(wx - doc.origin.x, wy - topHandleY)],
+      ["bottom", doc.origin.x, botHandleY, Math.hypot(wx - doc.origin.x, wy - botHandleY)],
+      ["left",   left,  (p.pdfTop+p.pdfBottom)/2, Math.abs(wx - left) + (wy < p.bandTop || wy > p.bandBottom ? 1e9 : 0)],
+      ["right",  right, (p.pdfTop+p.pdfBottom)/2, Math.abs(wx - right) + (wy < p.bandTop || wy > p.bandBottom ? 1e9 : 0)],
+    ];
+    for (const [side, , , dist] of cand) {
+      if (dist < bandPx && (!best || dist < best.dist)) best = { p, side, dist };
+    }
+  }
+
+  if (best) showPadHandleAt(doc, best.p, best.side, z, st);
+  else hidePadHandle();
+}
+
+function showPadHandleAt(doc: PdfDoc, p: LaidPage, side: string, z: number, st: any) {
+  const h = ensurePadHandle();
+  padHandleTarget = { page: p, side: side as any };
+  const left = doc.origin.x - p.pdfW / 2 - p.padLeft;
+  const right = doc.origin.x + p.pdfW / 2 + p.padRight;
+  const cx = doc.origin.x;
+  const cy = (p.pdfTop + p.pdfBottom) / 2;
+  const thick = 6, long = 40;
+  const insetW = 16 / z;
+
+  let worldX: number, worldY: number, w: number, hh: number;
+  if (side === "top")    { worldX = cx; worldY = p.bandTop + insetW;    w = long; hh = thick; }
+  else if (side === "bottom") { worldX = cx; worldY = p.bandBottom - insetW; w = long; hh = thick; }
+  else if (side === "left")   { worldX = left;  worldY = cy; w = thick; hh = long; }
+  else                        { worldX = right; worldY = cy; w = thick; hh = long; }
+
+  const sx = (worldX + st.scrollX) * z;
+  const sy = (worldY + st.scrollY) * z;
+  h.style.display = "";
+  h.style.width = w + "px";
+  h.style.height = hh + "px";
+  h.style.left = (sx - w / 2) + "px";
+  h.style.top = (sy - hh / 2) + "px";
+  h.style.cursor = (side === "left" || side === "right") ? "ew-resize" : "ns-resize";
+}
+
+function startPadDrag(e: PointerEvent) {
+  if (!pdfDoc || !padHandleTarget) return;
+  e.preventDefault(); e.stopPropagation();
+  padDragging = true;
+  const doc = pdfDoc;
+  const { page, side } = padHandleTarget;
+  const startPad = { top: page.padTop, bottom: page.padBottom, left: page.padLeft, right: page.padRight };
+  const z = (window as any).notesAPI.getAppState().zoom.value;
+  const sx = e.clientX, sy = e.clientY;
+
+  const shield = document.createElement("div");
+  shield.style.cssText = "position:fixed; inset:0; z-index:9999;";
+  document.body.appendChild(shield);
+
+  const move = (ev: PointerEvent) => {
+    const dx = (ev.clientX - sx) / z;
+    const dy = (ev.clientY - sy) / z;
+    // dragging outward grows the padding on that side
+    if (side === "top") {
+      const isFirst = page.index === Math.min(...doc.pages.map(p => p.index));
+      page.padTop = Math.max(0, isFirst ? startPad.top - dy : startPad.top + dy);
+    }
+    if (side === "bottom") page.padBottom = Math.max(0, startPad.bottom + dy); // down = grow
+    if (side === "left")   page.padLeft   = Math.max(0, startPad.left - dx);   // left = grow
+    if (side === "right")  page.padRight  = Math.max(0, startPad.right + dx);  // right = grow
+    layoutPages(doc);
+    computeBox(doc);
+    syncBox();
+    doc.rerender();
+    // keep the handle glued to the moving edge
+    const st = (window as any).notesAPI.getAppState();
+    showPadHandleAt(doc, page, side, st.zoom.value, st);
+  };
+  const up = (ev: PointerEvent) => {
+    padDragging = false;
+    shield.removeEventListener("pointermove", move);
+    shield.removeEventListener("pointerup", up);
+    shield.remove();
+  };
+  shield.addEventListener("pointermove", move);
+  shield.addEventListener("pointerup", up);
+  shield.setPointerCapture(e.pointerId);
+}
+
+let sepLayer: HTMLDivElement | null = null;
+
+function drawSeparators(doc: PdfDoc) {
+  if (!sepLayer) {
+    sepLayer = document.createElement("div");
+    sepLayer.id = "pdf-seps";
+    sepLayer.style.cssText = "position:fixed; inset:0; z-index:149; pointer-events:none; overflow:hidden;";
+    document.body.appendChild(sepLayer);
+  }
+  sepLayer.innerHTML = "";
+
+  const st = (window as any).notesAPI.getAppState();
+  const z = st.zoom.value;
+
+  // separator lines between pages — FULL MODE ONLY (page-mode has one page, no seams)
+  if (doc.mode === "full") {
+    const left = doc.origin.x - Math.max(...doc.pages.map(p => p.pdfW)) / 2 - Math.max(...doc.pages.map(p => p.padLeft));
+    const right = doc.origin.x + Math.max(...doc.pages.map(p => p.pdfW)) / 2 + Math.max(...doc.pages.map(p => p.padRight));
+    const sxL = (left + st.scrollX) * z;
+    const sxR = (right + st.scrollX) * z;
+    for (let i = 0; i < doc.pages.length - 1; i++) {
+      const seamY = doc.pages[i].bandBottom;
+      const sy = (seamY + st.scrollY) * z;
+      const line = document.createElement("div");
+      line.style.cssText =
+        `position:absolute; left:${sxL}px; width:${sxR - sxL}px; top:${sy}px; ` +
+        `border-top:2px dashed #999; opacity:0.6;`;
+      sepLayer.appendChild(line);
+    }
+  }
+
+  // per-page padded outline — BOTH modes (in page-mode, only the current page is positioned in the slot)
+  const outlinePages = doc.mode === "page"
+    ? doc.pages.filter(p => p.index === doc.currentPage)
+    : doc.pages;
+  for (const p of outlinePages) {
+    const pl = (doc.origin.x - p.pdfW / 2 - p.padLeft + st.scrollX) * z;
+    const pt = (p.bandTop + st.scrollY) * z;
+    const pw = (p.pdfW + p.padLeft + p.padRight) * z;
+    const ph = (p.bandBottom - p.bandTop) * z;
+    const outline = document.createElement("div");
+    outline.style.cssText =
+      `position:absolute; left:${pl}px; top:${pt}px; width:${pw}px; height:${ph}px; ` +
+      `border:1px solid rgba(120,120,120,0.25); pointer-events:none;`;
+    sepLayer.appendChild(outline);
+  }
 }
