@@ -286,6 +286,7 @@ export function initNotesPanel() {
   panel.querySelector("#np-target")!.addEventListener("click", doSetTarget);
   panel.querySelector("#np-link")!.addEventListener("click", doLink);
 
+  
   const toggleBtn = panel.querySelector("#np-toggle") as HTMLButtonElement;
   toggleBtn.addEventListener("click", () => {
     const collapsed = panel.classList.toggle("np-collapsed");
@@ -294,9 +295,11 @@ export function initNotesPanel() {
 
   panel.querySelector("#np-mode")!.addEventListener("click", () => {
     if (!pdfDoc) return toast("no PDF loaded");
-    setMode(pdfDoc, pdfDoc.mode === "full" ? "page" : "full");
-    toast(pdfDoc.mode === "page" ? `page mode (${pdfDoc.currentPage})` : "full mode");
+    const next = pdfDoc.mode === "full" ? "page" : pdfDoc.mode === "page" ? "scroll" : "full";
+    setMode(pdfDoc, next);
+    toast(next + " mode");
   });
+  
   panel.querySelector("#np-prev")!.addEventListener("click", () => {
     if (!pdfDoc || pdfDoc.mode !== "page") return;
     goToPage(pdfDoc, pdfDoc.currentPage - 1);
@@ -307,6 +310,23 @@ export function initNotesPanel() {
     goToPage(pdfDoc, pdfDoc.currentPage + 1);
     toast(`page ${pdfDoc.currentPage}`);
   });
+
+  document.addEventListener("wheel", (e) => {
+    if (!pdfDoc || pdfDoc.mode !== "scroll" || !pdfDoc.scrollWindow) return;
+    const st = (window as any).notesAPI.getAppState();
+    const z = st.zoom.value;
+    const wx = e.clientX / z - st.scrollX;
+    const wy = e.clientY / z - st.scrollY;
+    const w = pdfDoc.scrollWindow;
+    const inside = wx >= w.x && wx <= w.x + w.w && wy >= w.y && wy <= w.y + w.h;
+    console.log("wheel:", { wx: wx.toFixed(0), wy: wy.toFixed(0), win: w, inside });
+    if (!inside) return;
+    e.preventDefault();
+    e.stopPropagation();
+    (e as any).stopImmediatePropagation?.();
+    pdfDoc.scrollOffset = Math.max(0, (pdfDoc.scrollOffset || 0) + e.deltaY / z);
+    pdfDoc.rerender();
+  }, { capture: true, passive: false });
 
   document.addEventListener("pointermove", (e) => {
     if (!padDragging) updatePadHandle(e.clientX, e.clientY);
@@ -611,7 +631,9 @@ type PdfDoc = {
   origin: { x: number; y: number };
   box: { x: number; y: number; w: number; h: number };
   boxEl?: HTMLDivElement;
-  mode: "full" | "page";
+  mode: "full" | "page" | "scroll";        // ← add "scroll"
+  scrollWindow?: { x: number; y: number; w: number; h: number };  // world-placed window
+  scrollOffset?: number;                    // how far scrolled within (world units), stage 2
   currentPage: number;
   bytes?: ArrayBuffer;
   rerender: () => Promise<void>;
@@ -758,12 +780,13 @@ async function mountPdfFromBuffer(buf: ArrayBuffer) {
   doc.rerender = async () => {
     const st = (window as any).notesAPI.getAppState();
     const zoom = st.zoom.value;
+    const off = doc.mode === "scroll" ? (doc.scrollOffset || 0) : 0;
     for (const p of doc.pages) {
       if (doc.mode === "page" && p.index !== doc.currentPage) {
         p.canvas.style.display = "none";
         continue;
       }
-      await renderPage(p, zoom, st.scrollX, st.scrollY);
+      await renderPage(p, zoom, st.scrollX, st.scrollY - off);
     }
     syncPdf();
   };
@@ -785,13 +808,15 @@ function syncPdf() {
   if (!pdfDoc) return;
   const st = (window as any).notesAPI.getAppState();
   const zoom = st.zoom.value;
+  const off = pdfDoc.mode === "scroll" ? (pdfDoc.scrollOffset || 0) : 0;
   for (const p of pdfDoc.pages) {
     if (!p._patch) continue;
     const sx = Math.round((p._patch.wx + st.scrollX) * zoom);
-    const sy = Math.round((p._patch.wy + st.scrollY) * zoom);
+    const sy = Math.round((p._patch.wy - off + st.scrollY) * zoom);  // ← subtract scrollOffset
     p.canvas.style.transform = `translate(${sx}px, ${sy}px) scale(${zoom})`;
   }
   drawSeparators(pdfDoc);
+  applyScrollClip(pdfDoc);
 }
 
 // debounced crispen after motion stops
@@ -967,14 +992,27 @@ function pointInBox(doc: PdfDoc, wx: number, wy: number): boolean {
   return wx >= b.x && wx <= b.x + b.w && wy >= b.y && wy <= b.y + b.h;
 }
 
-function setMode(doc: PdfDoc, mode: "full" | "page") {
+function setMode(doc: PdfDoc, mode: "full" | "page" | "scroll") {
   doc.mode = mode;
+  if (mode === "scroll" && !doc.scrollWindow) {
+    // default window: page-width, ~60% page-height, near the top
+    const pw = Math.max(...doc.pages.map(p => p.pdfW));
+    const ph = doc.pages[0].pdfH;
+    doc.scrollWindow = {
+      x: doc.origin.x - pw / 2,
+      y: doc.origin.y,
+      w: pw,
+      h: ph * 0.6,
+    };
+    doc.scrollOffset = 0;
+  }
   layoutPages(doc);
   computeBox(doc);
   applyStrokeVisibility(doc);
   syncBox();
   doc.rerender();
-    if (mode === "page") {
+  applyScrollClip(doc);
+  if (mode === "page") {
     const api = (window as any).notesAPI;
     const st = api.getAppState();
     const vw = window.innerWidth, vh = window.innerHeight;
@@ -1215,4 +1253,20 @@ function drawSeparators(doc: PdfDoc) {
       `border:1px solid rgba(120,120,120,0.25); pointer-events:none;`;
     sepLayer.appendChild(outline);
   }
+}
+
+function applyScrollClip(doc: PdfDoc) {
+  if (!doc.el) return;
+  if (doc.mode !== "scroll" || !doc.scrollWindow) {
+    doc.el.style.clipPath = "";   // no clip in other modes
+    return;
+  }
+  const st = (window as any).notesAPI.getAppState();
+  const z = st.zoom.value;
+  const w = doc.scrollWindow;
+  const sx = (w.x + st.scrollX) * z;
+  const sy = (w.y + st.scrollY) * z;
+  const sw = w.w * z, sh = w.h * z;
+  // clip the pdf-layer to the window's screen rect
+  doc.el.style.clipPath = `inset(${sy}px calc(100% - ${sx + sw}px) calc(100% - ${sy + sh}px) ${sx}px)`;
 }
