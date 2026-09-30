@@ -62,6 +62,9 @@ export function initNotesPanel() {
     <button id="np-load"   title="Load">📂</button>
     <button id="np-target" title="Set target">🎯</button>
     <button id="np-link"   title="Link to target">🔗</button>
+    <button id="np-mode"   title="Toggle full/page mode">📄</button>
+    <button id="np-prev"   title="Previous page">◀</button>
+    <button id="np-next"   title="Next page">▶</button>
   `;
   document.body.appendChild(panel);
 
@@ -226,6 +229,22 @@ export function initNotesPanel() {
     toggleBtn.textContent = collapsed ? "‹" : "›";
   });
 
+  panel.querySelector("#np-mode")!.addEventListener("click", () => {
+    if (!pdfDoc) return toast("no PDF loaded");
+    setMode(pdfDoc, pdfDoc.mode === "full" ? "page" : "full");
+    toast(pdfDoc.mode === "page" ? `page mode (${pdfDoc.currentPage})` : "full mode");
+  });
+  panel.querySelector("#np-prev")!.addEventListener("click", () => {
+    if (!pdfDoc || pdfDoc.mode !== "page") return;
+    goToPage(pdfDoc, pdfDoc.currentPage - 1);
+    toast(`page ${pdfDoc.currentPage}`);
+  });
+  panel.querySelector("#np-next")!.addEventListener("click", () => {
+    if (!pdfDoc || pdfDoc.mode !== "page") return;
+    goToPage(pdfDoc, pdfDoc.currentPage + 1);
+    toast(`page ${pdfDoc.currentPage}`);
+  });
+
   (window as any).openNotePopup = openNotePopup;
 
   // detect clicks on linked strokes
@@ -332,15 +351,25 @@ export function initNotesPanel() {
 
 function computeBox(doc: PdfDoc) {
   const pages = doc.pages;
-  const widest = Math.max(...pages.map(p => p.pdfW));
+  const halfW = Math.max(...pages.map(p => p.pdfW)) / 2;
   const maxLeft = Math.max(...pages.map(p => p.padLeft));
   const maxRight = Math.max(...pages.map(p => p.padRight));
+  if (doc.mode === "page") {
+    const cur = pages.find(p => p.index === doc.currentPage) || pages[0];
+    doc.box = {
+      x: doc.origin.x - halfW - maxLeft,
+      y: cur.bandTop,
+      w: halfW * 2 + maxLeft + maxRight,
+      h: cur.bandBottom - cur.bandTop,
+    };
+    return;
+  }
   const top = pages[0].bandTop;
   const bottom = pages[pages.length - 1].bandBottom;
   doc.box = {
-    x: doc.origin.x - maxLeft,
+    x: doc.origin.x - halfW - maxLeft,
     y: top,
-    w: maxLeft + widest + maxRight,
+    w: halfW * 2 + maxLeft + maxRight,
     h: bottom - top,
   };
 }
@@ -511,6 +540,8 @@ type PdfDoc = {
   origin: { x: number; y: number };
   box: { x: number; y: number; w: number; h: number };
   boxEl?: HTMLDivElement;
+  mode: "full" | "page";            // ← add (scroll comes later)
+  currentPage: number;              // ← which page shows in page-mode
   rerender: () => Promise<void>;
 };
 
@@ -518,6 +549,18 @@ let pdfDoc: PdfDoc | null = null;
 
 // Recompute each page's world-space band from paddings (the cascade).
 function layoutPages(doc: PdfDoc) {
+  if (doc.mode === "page") {
+    // all pages share one slot; frame uses max padding across pages
+    const maxTop = Math.max(...doc.pages.map(p => p.padTop));
+    for (const p of doc.pages) {
+      p.bandTop = doc.origin.y;
+      p.pdfTop = doc.origin.y + maxTop;       // consistent top across all pages
+      p.pdfBottom = p.pdfTop + p.pdfH;
+      p.bandBottom = p.pdfBottom + Math.max(...doc.pages.map(pp => pp.padBottom));
+    }
+    return;
+  }
+  // full mode: stack vertically (existing)
   let y = doc.origin.y;
   for (const p of doc.pages) {
     p.bandTop = y;
@@ -560,6 +603,7 @@ async function mountPdf(file: File) {
     el, pdf, pages, padWidth: 0,
     origin: {x: 0, y: 0},
     box: { x: 0, y: 0, w: 0, h: 0 },   // placeholder, computed next
+    mode: "full", currentPage: 1,
     rerender: async () => {},
   };
   pdfDoc = doc;
@@ -576,8 +620,8 @@ async function mountPdf(file: File) {
     const mX = (worldRight - worldLeft) * 0.5, mY = (worldBottom - worldTop) * 0.5;
 
     // clip to THIS page's PDF rect in world coords
-    const pageLeft = doc.origin.x;
-    const pageRight = pageLeft + p.pdfW;
+    const pageLeft = doc.origin.x - p.pdfW / 2;
+    const pageRight = doc.origin.x + p.pdfW / 2;
     const renderScale = zoom;
     const g = 1 / renderScale;
     const wx = Math.max(pageLeft, Math.floor((worldLeft - mX) / g) * g);
@@ -636,6 +680,10 @@ async function mountPdf(file: File) {
     const st = (window as any).notesAPI.getAppState();
     const zoom = st.zoom.value;
     for (const p of doc.pages) {
+      if (doc.mode === "page" && p.index !== doc.currentPage) {
+        p.canvas.style.display = "none";   // hide non-current pages
+        continue;
+      }
       await renderPage(p, zoom, st.scrollX, st.scrollY);
     }
     syncPdf();
@@ -764,37 +812,42 @@ function classifyStroke(el: any) {
   if (!pdfDoc || el.type !== "freedraw") return;
   const doc = pdfDoc;
 
-  // start point in world coords (element x/y is the stroke's origin; points[0] is 0,0)
   const startX = el.x;
   const startY = el.y;
 
-  // must start inside the box to be page-bound
-  if (!pointInBox(doc, startX, startY)) return; // free stroke, leave untagged
+  if (!pointInBox(doc, startX, startY)) return; // free stroke
 
   const page = pageAtWorldY(doc, startY);
   if (!page) return;
 
-  // stroke's world bounding box (element x/y + width/height)
-  const strokeLeft = el.x;
-  const strokeRight = el.x + el.width;
+  // find the stroke's true horizontal extremes across ALL points (shape-agnostic)
+  const pts = el.points;
+  if (!pts || pts.length === 0) return;
+  let minX = Infinity, maxX = -Infinity;
+  for (const pt of pts) {
+    if (pt[0] < minX) minX = pt[0];
+    if (pt[0] > maxX) maxX = pt[0];
+  }
+  const leftWorldX = el.x + minX;
+  const rightWorldX = el.x + maxX;
 
-  // page's current world horizontal extent
-  const pageLeft = doc.origin.x;
-  const pageRight = doc.origin.x + page.pdfW + page.padRight;
-  const pageLeftEdge = doc.origin.x - page.padLeft;
-
-  // auto-extend right if the stroke runs past the right edge
-  const extraMargin = el.height; // ~one line-height, so next letter fits
+  const contentLeft = doc.origin.x - page.pdfW / 2;
+  const contentRight = doc.origin.x + page.pdfW / 2;
+  const extraMargin = el.height;
   let extended = false;
-  if (strokeRight > pageRight) {
-    page.padRight += (strokeRight - pageRight) + extraMargin;
+
+  if (rightWorldX > contentRight) {
+    page.padRight = Math.max(page.padRight, (rightWorldX - contentRight) + extraMargin);
     extended = true;
   }
-  // auto-extend left if it runs past the left edge
-  if (strokeLeft < pageLeftEdge) {
-    page.padLeft += (pageLeftEdge - strokeLeft) + extraMargin;
+  if (leftWorldX < contentLeft) {
+    page.padLeft = Math.max(page.padLeft, (contentLeft - leftWorldX) + extraMargin);
     extended = true;
   }
+
+  console.log("L=" + leftWorldX.toFixed(0) + " R=" + rightWorldX.toFixed(0) +
+    " cL=" + contentLeft.toFixed(0) + " cR=" + contentRight.toFixed(0) +
+    " boxL=" + doc.box.x.toFixed(0) + " padL=" + page.padLeft.toFixed(0) + " ext=" + extended);
 
   if (extended) {
     layoutPages(doc);
@@ -803,21 +856,18 @@ function classifyStroke(el: any) {
     doc.rerender();
   }
 
-  // tag the stroke with its page (page-local coords stored for later move/hide)
   const api = (window as any).notesAPI;
-    api.updateScene({
+  api.updateScene({
     elements: api.getSceneElements().map((e: any) =>
       e.id === el.id
         ? { ...e, customData: {
             ...e.customData,
             page: page.index,
-            pageX: el.x - doc.origin.x,        // offset from page's x-origin
-            pageY: el.y - page.bandTop,        // offset from page's band top
+            pageX: el.x - doc.origin.x,   // offset from CENTER origin (consistent now)
+            pageY: el.y - page.bandTop,
           } }
         : e),
   });
-
-  console.log(`stroke bound to page ${page.index}${extended ? " (extended)" : ""}`);
 }
 
 // Which page's band contains a given world Y? Returns the page or null.
@@ -834,3 +884,28 @@ function pointInBox(doc: PdfDoc, wx: number, wy: number): boolean {
   return wx >= b.x && wx <= b.x + b.w && wy >= b.y && wy <= b.y + b.h;
 }
 
+function setMode(doc: PdfDoc, mode: "full" | "page") {
+  doc.mode = mode;
+  layoutPages(doc);
+  computeBox(doc);
+  syncBox();
+  doc.rerender();
+  if (mode === "page") {
+    // snap camera to the slot once
+    const cur = doc.pages.find(p => p.index === doc.currentPage) || doc.pages[0];
+    const api = (window as any).notesAPI;
+    api.setViewport({
+      target: [{ x: doc.box.x, y: doc.box.y, width: doc.box.w, height: doc.box.h } as any],
+      fit: "scale-down", animation: true,
+    });
+  }
+}
+
+function goToPage(doc: PdfDoc, index: number) {
+  doc.currentPage = Math.max(1, Math.min(doc.pages.length, index));
+  layoutPages(doc);   // (harmless in page-mode; keeps things consistent)
+  computeBox(doc);
+  syncBox();
+  doc.rerender();
+  // no camera move on flip (per your decision)
+}
