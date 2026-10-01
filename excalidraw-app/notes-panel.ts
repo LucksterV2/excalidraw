@@ -191,10 +191,6 @@ export function initNotesPanel() {
   `;
   document.head.appendChild(style);
 
-    function toast(message: string) {
-    (window as any).notesAPI?.setToast?.({ message, duration: 2000 });
-  }
-
     (window as any).deleteDoc = (hash: string) =>
     fetch(API_BASE + "/docdelete.php?hash=" + hash).then(r => r.json()).then(console.log)
 
@@ -263,7 +259,7 @@ export function initNotesPanel() {
         label.textContent = row.name;
         label.style.cssText = "flex:1; cursor:pointer;";
         label.addEventListener("click", async () => {
-          try { await loadNote(row.name); currentName = row.name; toast("loaded ✓"); close(); }
+          try { await loadNote(row.name); currentName = row.name; toast("loaded ✓"); updateFlipButtons(); close(); }
           catch { toast("load failed"); }
         });
         const del = document.createElement("button");
@@ -364,6 +360,7 @@ export function initNotesPanel() {
   clusters.id = "np-clusters";
   clusters.innerHTML = `
     <button id="npc-delpdf" title="Remove PDF">🗑</button>
+    <button id="npc-bind" title="Bind selection to PDF">📌</button>
     <button id="npc-mode" title="Mode">📄</button>
     <button id="npc-prev" title="Prev">◀</button>
     <button id="npc-next" title="Next">▶</button>
@@ -379,14 +376,17 @@ export function initNotesPanel() {
   `;
   document.head.appendChild(cstyle);
 
-    clusters.querySelector("#npc-mode")!.addEventListener("click", () => {
+
+  clusters.querySelector("#npc-bind")!.addEventListener("click", () => {
+    (window as any).bindSelection();
+  });
+  clusters.querySelector("#npc-mode")!.addEventListener("click", () => {
     const doc = docAtViewCenter();
     if (!doc) return toast("no PDF loaded");
     const next = doc.mode === "full" ? "page" : doc.mode === "page" ? "scroll" : "full";
     setMode(doc, next);
     toast(next + " mode");
-    (clusters.querySelector("#npc-prev") as HTMLElement).style.display = doc.mode === "page" ? "" : "none";
-    (clusters.querySelector("#npc-next") as HTMLElement).style.display = doc.mode === "page" ? "" : "none";
+    updateFlipButtons();
   });
   clusters.querySelector("#npc-prev")!.addEventListener("click", () => {
     const doc = docAtViewCenter();
@@ -418,6 +418,13 @@ export function initNotesPanel() {
     refreshInk();   // re-stash this doc's now-orphaned strokes
     toast("PDF removed");
   });
+
+  function updateFlipButtons() {
+    const doc = docAtViewCenter();
+    const show = doc && doc.mode === "page";
+    (clusters.querySelector("#npc-prev") as HTMLElement).style.display = show ? "" : "none";
+    (clusters.querySelector("#npc-next") as HTMLElement).style.display = show ? "" : "none";
+  }
 
   document.addEventListener("wheel", (e) => {
     const st = (window as any).notesAPI.getAppState();
@@ -796,6 +803,15 @@ function docAtViewCenter(): PdfDoc | null {
   return best;
 }
 
+function updateBoxHighlight() {
+  const active = docAtViewCenter();
+  for (const d of pdfDocs) {
+    if (!d.boxEl) continue;
+    d.boxEl.style.borderColor = (d === active) ? "#e8873a" : "#4a90d9";  // active=orange, others=blue
+    d.boxEl.style.borderWidth = (d === active) ? "3px" : "2px";
+  }
+}
+
 function findFreeOrigin(): { x: number; y: number } {
   const st = (window as any).notesAPI.getAppState();
   const z = st.zoom.value;
@@ -1035,6 +1051,8 @@ function syncBox() {
     doc.boxEl.style.width = b.w * z + "px";
     doc.boxEl.style.height = b.h * z + "px";
   }
+  updateBoxHighlight();
+  updateFlipButtonsGlobal();
 }
 
 // screen-pixel drag → world-delta, via a shield (same trick as the popup)
@@ -1103,7 +1121,9 @@ function classifyStroke(el: any) {
   if (!doc) return;   // not in any doc's box → free stroke, leave untagged
 
   const startY = el.y + off;
-  const page = pageAtWorldY(doc, startY);
+  const page = doc.mode === "page"
+    ? doc.pages.find(p => p.index === doc.currentPage)
+    : pageAtWorldY(doc, startY);
   if (!page) return;
 
   const pts = el.points;
@@ -1473,4 +1493,63 @@ function compactStroke(points: any[], pressures: any[] | undefined) {
     lastKept = pt;
   }
   return { points: outPts, pressures: (pressures && pressures.length) ? outPr : pressures };
+}
+
+(window as any).bindSelection = () => {
+  const api = (window as any).notesAPI;
+  const doc = docAtViewCenter();
+  if (!doc) { toast("no PDF selected"); return; }
+  const ids = Object.keys(api.getAppState().selectedElementIds || {});
+  if (!ids.length) { toast("select elements first"); return; }
+  const off = doc.mode === "scroll" ? (doc.scrollOffset || 0) : 0;
+  let bound = 0, extended = false;
+
+  // which page? In page-mode it's the current page (pages overlap in the slot,
+  // so pageAtWorldY can't disambiguate). In full/scroll, use the element's Y.
+  const pageFor = (e: any) =>
+    doc.mode === "page"
+      ? doc.pages.find(p => p.index === doc.currentPage)
+      : pageAtWorldY(doc, e.y + off);
+
+  const sel = api.getSceneElements().filter((e: any) => ids.includes(e.id));
+  for (const e of sel) {
+    const page = pageFor(e);
+    if (!page) continue;
+    const elemLeft = e.x;
+    const elemRight = e.x + (e.width || 0);
+    const contentLeft = doc.origin.x - page.pdfW / 2;
+    const contentRight = doc.origin.x + page.pdfW / 2;
+    const margin = e.height || 20;
+    if (elemRight > contentRight) { page.padRight = Math.max(page.padRight, (elemRight - contentRight) + margin); extended = true; }
+    if (elemLeft < contentLeft)   { page.padLeft  = Math.max(page.padLeft,  (contentLeft - elemLeft) + margin);  extended = true; }
+  }
+  if (extended) { layoutPages(doc); computeBox(doc); syncBox(); doc.rerender(); }
+
+  api.updateScene({
+    elements: api.getSceneElements().map((e: any) => {
+      if (!ids.includes(e.id)) return e;
+      const page = pageFor(e);
+      if (!page) return e;
+      bound++;
+      return { ...e, customData: {
+        ...e.customData, docId: doc.id, page: page.index,
+        pageX: e.x - doc.origin.x, pageY: (e.y + off) - page.bandTop,
+      }};
+    }),
+  });
+  toast(`bound ${bound} to ${doc.mode === "page" ? "page " + doc.currentPage : "doc"}`);
+  refreshInk();
+};
+function toast(message: string) {
+  (window as any).notesAPI?.setToast?.({ message, duration: 2000 });
+}
+
+function updateFlipButtonsGlobal() {
+  const prev = document.getElementById("npc-prev");
+  const next = document.getElementById("npc-next");
+  if (!prev || !next) return;
+  const doc = docAtViewCenter();
+  const show = doc && doc.mode === "page";
+  prev.style.display = show ? "" : "none";
+  next.style.display = show ? "" : "none";
 }
