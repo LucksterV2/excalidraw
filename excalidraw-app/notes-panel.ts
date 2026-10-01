@@ -103,6 +103,22 @@ async function loadNote(name: string) {
     appState: { ...api.getAppState(), ...scene.appState },
   });
 
+  // restore image files from their hashes
+  const imgEls = scene.elements.filter((e: any) => e.type === "image" && e.customData?.imgHash);
+  for (const el of imgEls) {
+    try {
+      const h = el.customData.imgHash;
+      const r = await fetch(API_BASE + "/imgload.php?hash=" + h);
+      if (!r.ok) continue;
+      const blob = await r.blob();
+      const dataURL = await new Promise<string>((res) => {
+        const fr = new FileReader(); fr.onload = () => res(fr.result as string); fr.readAsDataURL(blob);
+      });
+      api.addFiles([{ id: el.fileId, dataURL, mimeType: el.customData.imgMime || "image/png", created: Date.now() }]);
+    } catch {}
+  }
+  api.updateScene({ elements: api.getSceneElements() });  // refresh so images render
+
   refreshInk();   // position/stash bound strokes per each doc's mode
 }
 
@@ -308,10 +324,32 @@ export function initNotesPanel() {
   panel.querySelector("#np-load")!.addEventListener("click", openLoadDialog);
   panel.querySelector("#np-target")!.addEventListener("click", doSetTarget);
   panel.querySelector("#np-link")!.addEventListener("click", doLink);
-    panel.querySelector("#np-pdf")!.addEventListener("click", () => {
+  panel.querySelector("#np-pdf")!.addEventListener("click", () => {
     const inp = document.createElement("input");
-    inp.type = "file"; inp.accept = "application/pdf";
-    inp.onchange = () => inp.files && mountPdf(inp.files[0]).catch(e => { console.error(e); toast("PDF load failed"); });
+    inp.type = "file";
+    inp.accept = "application/pdf,image/*";   // ← accept both
+    inp.onchange = async () => {
+      const file = inp.files?.[0];
+      if (!file) return;
+      if (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) {
+        mountPdf(file).catch(e => { console.error(e); toast("PDF load failed"); });
+      } else if (file.type.startsWith("image/")) {
+        try {
+          const buf = await file.arrayBuffer();
+          const res = await fetch(API_BASE + "/imgsave.php", {
+            method: "POST", headers: { "Content-Type": file.type || "image/png" }, body: buf,
+          });
+          const { hash } = await res.json();
+          const dataURL = await new Promise<string>((resolve) => {
+            const fr = new FileReader(); fr.onload = () => resolve(fr.result as string); fr.readAsDataURL(file);
+          });
+          await placeImage(hash, dataURL, file.type || "image/png");
+          toast("image added");
+        } catch (e) { console.error(e); toast("image failed"); }
+      } else {
+        toast("unsupported file type");
+      }
+    };
     inp.click();
   });
   
@@ -403,6 +441,9 @@ export function initNotesPanel() {
   (clusters.querySelector("#npc-next") as HTMLElement).style.display = "none";
 
   clusters.querySelector("#npc-delpdf")!.addEventListener("click", async () => {
+    const api = (window as any).notesAPI;
+    const selCount = Object.keys(api.getAppState().selectedElementIds || {}).length;
+    if (selCount > 0) { toast("deselect first — 🗑 removes the PDF, not elements"); return; }
     const doc = docAtViewCenter();
     if (!doc || !doc.bytes) return toast("no PDF loaded");
     if (!confirm("Remove this PDF from the server?")) return;
@@ -441,7 +482,9 @@ export function initNotesPanel() {
     e.preventDefault();
     e.stopPropagation();
     (e as any).stopImmediatePropagation?.();
-    doc.scrollOffset = Math.max(0, (doc.scrollOffset || 0) + e.deltaY / z);
+    const lastBottom = doc.pages[doc.pages.length - 1].bandBottom;
+    const maxOffset = Math.max(0, lastBottom - doc.scrollWindow!.y - doc.scrollWindow!.h + 20);
+    doc.scrollOffset = Math.max(0, Math.min(maxOffset, (doc.scrollOffset || 0) + e.deltaY / z));
     doc.rerender();
     refreshInk();
   }, { capture: true, passive: false });
@@ -762,6 +805,7 @@ type PdfDoc = {
   box: { x: number; y: number; w: number; h: number };
   boxEl?: HTMLDivElement;
   sepEl?: HTMLDivElement;
+  edgeEls?: { top: HTMLElement; bottom: HTMLElement };
   mode: "full" | "page" | "scroll";        // ← add "scroll"
   scrollWindow?: { x: number; y: number; w: number; h: number };  // world-placed window
   scrollOffset?: number;                    // how far scrolled within (world units), stage 2
@@ -1026,11 +1070,15 @@ function createBox(doc: PdfDoc) {
     return e;
   };
   const edgeThick = 8;
-  const top = mkEdge(`left:0;right:0;top:0;height:${edgeThick}px;cursor:move;`);
-  const bottom = mkEdge(`left:0;right:0;bottom:0;height:${edgeThick}px;cursor:move;`);
+  const top = mkEdge(`left:0;right:0;top:0;height:${edgeThick}px;cursor:ns-resize;`);
+  const bottom = mkEdge(`left:0;right:0;bottom:0;height:${edgeThick}px;cursor:ns-resize;`);
   const left = mkEdge(`top:0;bottom:0;left:0;width:${edgeThick}px;cursor:move;`);
   const right = mkEdge(`top:0;bottom:0;right:0;width:${edgeThick}px;cursor:move;`);
-  [top, bottom, left, right].forEach(e => attachMove(e, doc));
+  doc.edgeEls =  { top, bottom};
+  attachEdge(top, doc, "top");
+  attachEdge(bottom, doc, "bottom");
+  attachEdge(left, doc, "left");
+  attachEdge(right, doc, "right");
 
   document.body.appendChild(box);
   doc.boxEl = box;
@@ -1050,6 +1098,11 @@ function syncBox() {
     doc.boxEl.style.top = sy + "px";
     doc.boxEl.style.width = b.w * z + "px";
     doc.boxEl.style.height = b.h * z + "px";
+    if (doc.edgeEls) {
+      const c = doc.mode === "scroll" ? "ns-resize" : "move";
+      doc.edgeEls.top.style.cursor = c;
+      doc.edgeEls.bottom.style.cursor = c;
+    }
   }
   updateBoxHighlight();
   updateFlipButtonsGlobal();
@@ -1078,17 +1131,37 @@ function dragWithShield(onMove: (dxWorld: number, dyWorld: number) => void) {
   };
 }
 
-function attachMove(el: HTMLElement, doc: PdfDoc) {
+function attachEdge(el: HTMLElement, doc: PdfDoc, side: "top"|"bottom"|"left"|"right") {
   el.addEventListener("pointerdown", (e) => {
+    // In scroll mode, top/bottom edges RESIZE the window; others move the doc.
+    if (doc.mode === "scroll" && (side === "top" || side === "bottom") && doc.scrollWindow) {
+      const startWin = { y: doc.scrollWindow.y, h: doc.scrollWindow.h };
+      dragWithShield((_dx, dy) => {
+        if (!doc.scrollWindow) return;
+        if (side === "bottom") {
+          doc.scrollWindow.h = Math.max(50, startWin.h + dy);   // drag bottom down = taller
+        } else { // top
+          const newY = startWin.y + dy;
+          const newH = startWin.h - dy;                          // drag top up = taller
+          if (newH >= 50) { doc.scrollWindow.y = newY; doc.scrollWindow.h = newH; }
+        }
+        computeBox(doc);        // box tracks the window
+        syncBox();
+        applyScrollClip();      // re-clip to new window size
+        refreshInk();           // re-evaluate which ink is in the window
+      })(e as PointerEvent);
+      return;
+    }
+    // default: move the document (all modes, left/right in scroll, everything else)
     const start = { ...doc.origin };
     dragWithShield((dx, dy) => {
       doc.origin.x = start.x + dx;
       doc.origin.y = start.y + dy;
       layoutPages(doc);
       computeBox(doc);
-      repositionBoundStrokes(doc)
+      repositionBoundStrokes(doc);
       syncBox();
-      doc.rerender();   // ← re-render pages at new positions (not just syncPdf)
+      doc.rerender();
     })(e as PointerEvent);
   });
 }
@@ -1420,7 +1493,8 @@ function drawSeparators(doc: PdfDoc) {
   sep.innerHTML = "";
   const st = (window as any).notesAPI.getAppState();
   const z = st.zoom.value;
-
+  const off = doc.mode === "scroll" ? (doc.scrollOffset || 0) : 0;
+  
   if (doc.mode === "full") {
     const left = doc.origin.x - Math.max(...doc.pages.map(p => p.pdfW)) / 2 - Math.max(...doc.pages.map(p => p.padLeft));
     const right = doc.origin.x + Math.max(...doc.pages.map(p => p.pdfW)) / 2 + Math.max(...doc.pages.map(p => p.padRight));
@@ -1437,12 +1511,22 @@ function drawSeparators(doc: PdfDoc) {
   const outlinePages = doc.mode === "page" ? doc.pages.filter(p => p.index === doc.currentPage) : doc.pages;
   for (const p of outlinePages) {
     const pl = (doc.origin.x - p.pdfW / 2 - p.padLeft + st.scrollX) * z;
-    const pt = (p.bandTop + st.scrollY) * z;
+    const pt = (p.bandTop - off + st.scrollY) * z;
     const pw = (p.pdfW + p.padLeft + p.padRight) * z;
     const ph = (p.bandBottom - p.bandTop) * z;
     const outline = document.createElement("div");
     outline.style.cssText = `position:absolute; left:${pl}px; top:${pt}px; width:${pw}px; height:${ph}px; border:1px solid rgba(120,120,120,0.25); pointer-events:none;`;
     sep.appendChild(outline);
+  }
+
+  if (doc.mode === "scroll" && doc.scrollWindow) {
+    const w = doc.scrollWindow;
+    const sx = (w.x + st.scrollX) * z;
+    const sy = (w.y + st.scrollY) * z;
+    const sw = w.w * z, sh = w.h * z;
+    sep.style.clipPath = `inset(${sy}px calc(100% - ${sx + sw}px) calc(100% - ${sy + sh}px) ${sx}px)`;
+  } else {
+    sep.style.clipPath = "";
   }
 }
 
@@ -1552,4 +1636,29 @@ function updateFlipButtonsGlobal() {
   const show = doc && doc.mode === "page";
   prev.style.display = show ? "" : "none";
   next.style.display = show ? "" : "none";
+}
+
+async function placeImage(hash: string, dataURL: string, mime: string) {
+  const api = (window as any).notesAPI;
+  const fileId = ("img_" + hash.slice(0, 12)) as any;
+  // register the file bytes in Excalidraw's store
+  api.addFiles([{ id: fileId, dataURL, mimeType: mime, created: Date.now() }]);
+  // figure a reasonable placement size from the image
+  const dims = await new Promise<{w:number;h:number}>((res) => {
+    const im = new Image(); im.onload = () => res({ w: im.naturalWidth, h: im.naturalHeight }); im.src = dataURL;
+  });
+  // place at current view center, scaled to a sane size
+  const st = api.getAppState();
+  const z = st.zoom.value;
+  const cx = (window.innerWidth / 2) / z - st.scrollX;
+  const cy = (window.innerHeight / 2) / z - st.scrollY;
+  const maxDim = 400;
+  const scale = Math.min(1, maxDim / Math.max(dims.w, dims.h));
+  const w = dims.w * scale, h = dims.h * scale;
+  const { convertToExcalidrawElements } = await import("@excalidraw/excalidraw");
+  const els = convertToExcalidrawElements([
+    { type: "image", fileId, x: cx - w/2, y: cy - h/2, width: w, height: h,
+      customData: { imgHash: hash, imgMime: mime } } as any,
+  ]);
+  api.updateScene({ elements: [...api.getSceneElements(), ...els] });
 }
