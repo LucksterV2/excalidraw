@@ -19,32 +19,31 @@ const API_BASE = import.meta.env.DEV ? "https://notes.nodanio.dk" : "";
 async function saveNote(name: string) {
   const api = (window as any).notesAPI;
 
-  // if a PDF is loaded, ensure it's uploaded and capture its state
-  let pdfState: any = null;
-  if (pdfDoc) {
-    // upload the PDF bytes (dedupe means this is cheap if already stored)
-    const hash = await ensurePdfUploaded(pdfDoc);
-    pdfState = {
+  // capture every loaded PDF's state (upload each; dedupe makes repeats cheap)
+  const pdfs: any[] = [];
+  for (const doc of pdfDocs) {
+    const hash = await ensurePdfUploaded(doc);
+    pdfs.push({
+      id: doc.id,
       hash,
-      origin: pdfDoc.origin,
-      mode: pdfDoc.mode,
-      currentPage: pdfDoc.currentPage,
-      // per-page paddings (the only per-page state that isn't derivable)
-      pages: pdfDoc.pages.map(p => ({
+      origin: doc.origin,
+      mode: doc.mode,
+      currentPage: doc.currentPage,
+      scrollWindow: doc.scrollWindow || null,
+      scrollOffset: doc.scrollOffset || 0,
+      pages: doc.pages.map(p => ({
         index: p.index,
         padTop: p.padTop, padBottom: p.padBottom,
         padLeft: p.padLeft, padRight: p.padRight,
       })),
-    };
+    });
   }
 
-  // include stashed strokes so page-mode saves don't drop hidden ink
   const elements = [...api.getSceneElements(), ...strokeStash];
-
   const scene = {
     elements,
     appState: { viewBackgroundColor: api.getAppState().viewBackgroundColor },
-    pdf: pdfState,   // ← new: PDF reference + layout
+    pdfs,   // ← array (was singular `pdf`)
   };
   const res = await fetch(API_BASE + "/save.php", {
     method: "POST",
@@ -66,47 +65,57 @@ async function ensurePdfUploaded(doc: PdfDoc): Promise<string> {
 async function loadNote(name: string) {
   const api = (window as any).notesAPI;
   strokeStash = [];
+
+  // tear down ALL existing docs first (loading replaces the whole canvas)
+  teardownAllDocs();
+
   const res = await fetch(API_BASE + "/load.php?name=" + encodeURIComponent(name));
   if (!res.ok) throw new Error("load failed: " + res.status);
   const scene = await res.json();
 
-  if (scene.pdf) {
-    // note HAS a pdf → mount it and restore layout
-    await mountPdfFromHash(scene.pdf.hash);
-    if (pdfDoc) {
-      pdfDoc.origin = scene.pdf.origin;
-      pdfDoc.mode = scene.pdf.mode;
-      pdfDoc.currentPage = scene.pdf.currentPage;
-      const byIndex = new Map(scene.pdf.pages.map((sp: any) => [sp.index, sp]));
-      for (const p of pdfDoc.pages) {
-        const sp: any = byIndex.get(p.index);
-        if (sp) { p.padTop = sp.padTop; p.padBottom = sp.padBottom; p.padLeft = sp.padLeft; p.padRight = sp.padRight; }
-      }
-      layoutPages(pdfDoc);
-      computeBox(pdfDoc);
-      syncBox();
-      await pdfDoc.rerender();
-    }
-  } else {
-    if (pdfDoc) {
-      pdfDoc.el.remove();
-      pdfDoc.boxEl?.remove();
-      pdfDoc = null;
-    }
-    padDragging = false;
-    if (padHandle) { padHandle.remove(); padHandle = null; }
-    padHandleTarget = null;
-    if (sepLayer) { sepLayer.remove(); sepLayer = null; }
-  }
+  // support both new (pdfs[]) and old (pdf) saved formats
+  const pdfList = scene.pdfs || (scene.pdf ? [{ ...scene.pdf, id: null }] : []);
 
-  // restore elements (includes bound strokes + free strokes)
+  for (const sp of pdfList) {
+    await mountPdfFromHash(sp.hash);
+    const doc = pdfDocs[pdfDocs.length - 1];   // the one just mounted
+    if (!doc) continue;
+    if (sp.id) doc.id = sp.id;                  // ← restore saved id so strokes route
+    doc.origin = sp.origin;
+    doc.mode = sp.mode;
+    doc.currentPage = sp.currentPage;
+    doc.scrollWindow = sp.scrollWindow || undefined;
+    doc.scrollOffset = sp.scrollOffset || 0;
+    const byIndex = new Map(sp.pages.map((p: any) => [p.index, p]));
+    for (const p of doc.pages) {
+      const s: any = byIndex.get(p.index);
+      if (s) { p.padTop = s.padTop; p.padBottom = s.padBottom; p.padLeft = s.padLeft; p.padRight = s.padRight; }
+    }
+    layoutPages(doc);
+    computeBox(doc);
+    await doc.rerender();
+  }
+  syncBox();
+
+  // restore elements (bound + free)
   api.updateScene({
     elements: scene.elements,
     appState: { ...api.getAppState(), ...scene.appState },
   });
 
-  // re-apply stroke visibility for the restored mode (stash hidden pages)
-  if (pdfDoc) applyStrokeVisibility(pdfDoc);
+  refreshInk();   // position/stash bound strokes per each doc's mode
+}
+
+function teardownAllDocs() {
+  for (const d of pdfDocs) {
+    d.el.remove();
+    d.boxEl?.remove();
+    d.sepEl?.remove();
+  }
+  pdfDocs = [];
+  padDragging = false;
+  if (padHandle) { padHandle.remove(); padHandle = null; }
+  padHandleTarget = null;
 }
 
 async function searchNotes(q: string) {
@@ -303,10 +312,7 @@ export function initNotesPanel() {
   panel.querySelector("#np-load")!.addEventListener("click", openLoadDialog);
   panel.querySelector("#np-target")!.addEventListener("click", doSetTarget);
   panel.querySelector("#np-link")!.addEventListener("click", doLink);
-  panel.querySelector("#np-pdf")!.addEventListener("click", () => {
-    if (pdfDoc) {
-      if (!confirm("A PDF is already loaded. Adding another will replace it (and unsaved notes on it will be lost). Save first? Click Cancel to stop, OK to replace anyway.")) return;
-    }
+    panel.querySelector("#np-pdf")!.addEventListener("click", () => {
     const inp = document.createElement("input");
     inp.type = "file"; inp.accept = "application/pdf";
     inp.onchange = () => inp.files && mountPdf(inp.files[0]).catch(e => { console.error(e); toast("PDF load failed"); });
@@ -321,13 +327,12 @@ export function initNotesPanel() {
 
   panel.querySelector("#np-export")!.addEventListener("click", async () => {
     const api = (window as any).notesAPI;
-    let pdfState: any = null;
-    if (pdfDoc) {
-      pdfState = { hash: null, origin: pdfDoc.origin, mode: pdfDoc.mode, currentPage: pdfDoc.currentPage,
-        pages: pdfDoc.pages.map(p => ({ index: p.index, padTop: p.padTop, padBottom: p.padBottom, padLeft: p.padLeft, padRight: p.padRight })) };
-    }
+    const pdfs = pdfDocs.map(doc => ({
+      id: doc.id, hash: null, origin: doc.origin, mode: doc.mode, currentPage: doc.currentPage,
+      pages: doc.pages.map(p => ({ index: p.index, padTop: p.padTop, padBottom: p.padBottom, padLeft: p.padLeft, padRight: p.padRight })),
+    }));
     const scene = { elements: [...api.getSceneElements(), ...strokeStash],
-      appState: { viewBackgroundColor: api.getAppState().viewBackgroundColor }, pdf: pdfState };
+      appState: { viewBackgroundColor: api.getAppState().viewBackgroundColor }, pdfs };
     const blob = new Blob([JSON.stringify(scene)], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
@@ -397,44 +402,63 @@ export function initNotesPanel() {
   (clusters.querySelector("#npc-prev") as HTMLElement).style.display = "none";
   (clusters.querySelector("#npc-next") as HTMLElement).style.display = "none";
 
-    clusters.querySelector("#npc-delpdf")!.addEventListener("click", async () => {
-    if (!pdfDoc || !pdfDoc.bytes) return toast("no PDF loaded");
+  clusters.querySelector("#npc-delpdf")!.addEventListener("click", async () => {
+    const doc = docAtViewCenter();
+    if (!doc || !doc.bytes) return toast("no PDF loaded");
     if (!confirm("Remove this PDF from the server?")) return;
-    // hash the bytes to get the doc id (same sha-256 the server uses)
-    const buf = await crypto.subtle.digest("SHA-256", pdfDoc.bytes);
+    const buf = await crypto.subtle.digest("SHA-256", doc.bytes);
     const hash = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
     await fetch(API_BASE + "/docdelete.php?hash=" + hash).catch(()=>{});
-    // tear down the loaded PDF locally
-    pdfDoc.el.remove();
-    pdfDoc.boxEl?.remove();
-    pdfDoc = null;
+    doc.el.remove();
+    doc.boxEl?.remove();
+    doc.sepEl?.remove();
+    pdfDocs = pdfDocs.filter(d => d !== doc);   // remove from array
     if (padHandle) { padHandle.remove(); padHandle = null; }
     padHandleTarget = null;
-    if (sepLayer) { sepLayer.remove(); sepLayer = null; }
-    strokeStash = [];
+    refreshInk();   // re-stash this doc's now-orphaned strokes
     toast("PDF removed");
   });
 
   document.addEventListener("wheel", (e) => {
-    if (!pdfDoc || pdfDoc.mode !== "scroll" || !pdfDoc.scrollWindow) return;
     const st = (window as any).notesAPI.getAppState();
     const z = st.zoom.value;
     const wx = e.clientX / z - st.scrollX;
     const wy = e.clientY / z - st.scrollY;
-    const w = pdfDoc.scrollWindow;
-    const inside = wx >= w.x && wx <= w.x + w.w && wy >= w.y && wy <= w.y + w.h;
-    if (!inside) return;
+    // find a scroll-mode doc whose window is under the pointer
+    const doc = pdfDocs.find(d =>
+      d.mode === "scroll" && d.scrollWindow &&
+      wx >= d.scrollWindow.x && wx <= d.scrollWindow.x + d.scrollWindow.w &&
+      wy >= d.scrollWindow.y && wy <= d.scrollWindow.y + d.scrollWindow.h
+    );
+    if (!doc) return;
     e.preventDefault();
     e.stopPropagation();
     (e as any).stopImmediatePropagation?.();
-    pdfDoc.scrollOffset = Math.max(0, (pdfDoc.scrollOffset || 0) + e.deltaY / z);
-    pdfDoc.rerender();
-    applyScrollInk(pdfDoc);
+    doc.scrollOffset = Math.max(0, (doc.scrollOffset || 0) + e.deltaY / z);
+    doc.rerender();
+    refreshInk();
   }, { capture: true, passive: false });
 
   document.addEventListener("pointermove", (e) => {
     if (!padDragging) updatePadHandle(e.clientX, e.clientY);
   });
+
+  (window as any).assignToDoc = () => {
+    if (pdfDocs.length === 0) { toast("no PDF loaded"); return; }
+    if (pdfDocs.length > 1) { toast("multiple PDFs — ambiguous"); return; }
+    const doc = pdfDocs[0];
+    const api = (window as any).notesAPI;
+    const ids = Object.keys(api.getAppState().selectedElementIds || {});
+    if (!ids.length) { toast("select strokes first"); return; }
+    api.updateScene({
+      elements: api.getSceneElements().map((e: any) =>
+        ids.includes(e.id) && e.type === "freedraw"
+          ? { ...e, customData: { ...e.customData, docId: doc.id, page: doc.currentPage,
+              pageX: e.x - doc.origin.x, pageY: e.y - (doc.pages.find(p=>p.index===doc.currentPage)?.bandTop ?? 0) } }
+          : e),
+    });
+    toast(`assigned ${ids.length} to doc`);
+  };
 
   (window as any).openNotePopup = openNotePopup;
 
@@ -473,37 +497,26 @@ export function initNotesPanel() {
   if (mainApi?.onChange) {
     let syncing = false;
     mainApi.onChange(() => {
-      if (!pdfDoc || syncing || pdfDoc.mode === "scroll") return;
-      const doc = pdfDoc;
-      const pageById = new Map(doc.pages.map(p => [p.index, p]));
+      if (syncing || pdfDocs.length === 0) return;
+      const docById = new Map(pdfDocs.map(d => [d.id, d]));
       const els = mainApi.getSceneElements();
       let needsUpdate = false;
-
       const updated = els.map((e: any) => {
         const cd = e.customData;
-        if (cd?.page === undefined || cd.pageX === undefined) return e;
-        const p = pageById.get(cd.page);
+        if (cd?.docId === undefined || cd.pageX === undefined) return e;
+        const doc = docById.get(cd.docId);
+        if (!doc || doc.mode === "scroll") return e;   // skip scroll-mode (positions are offset-derived)
+        const p = doc.pages.find(pp => pp.index === cd.page);
         if (!p) return e;
-        // what canvas pos SHOULD be, given current offset + page position
         const expectedX = doc.origin.x + cd.pageX;
         const expectedY = p.bandTop + cd.pageY;
-        // if actual differs (user moved it), re-derive the offset
         if (Math.abs(e.x - expectedX) > 0.01 || Math.abs(e.y - expectedY) > 0.01) {
           needsUpdate = true;
-          return { ...e, customData: {
-            ...cd,
-            pageX: e.x - doc.origin.x,
-            pageY: e.y - p.bandTop,
-          } };
+          return { ...e, customData: { ...cd, pageX: e.x - doc.origin.x, pageY: e.y - p.bandTop } };
         }
         return e;
       });
-
-      if (needsUpdate) {
-        syncing = true;
-        mainApi.updateScene({ elements: updated });
-        syncing = false;
-      }
+      if (needsUpdate) { syncing = true; mainApi.updateScene({ elements: updated }); syncing = false; }
     });
   }
 
@@ -522,7 +535,7 @@ export function initNotesPanel() {
       }
       if (padHandleTarget && !padDragging) {
         const st2 = mainApi.getAppState();
-        showPadHandleAt(padHandleTarget.page, padHandleTarget.side, st2.zoom.value, st2);  // see note
+        showPadHandleAt(padHandleTarget.doc, padHandleTarget.page, padHandleTarget.side, st2.zoom.value, st2);
       }
       scheduleSharpen();
     });
@@ -536,17 +549,13 @@ export function initNotesPanel() {
   };
 
   (window as any).setPagePad = (pageIndex: number, top: number, bottom: number, left = 0, right = 0) => {
-    if (!pdfDoc) return;
-    const p = pdfDoc.pages.find(pp => pp.index === pageIndex);
+    const doc = pdfDocs[0];
+    if (!doc) return;
+    const p = doc.pages.find(pp => pp.index === pageIndex);
     if (!p) return;
-    p.padTop = Math.max(0, top);
-    p.padBottom = Math.max(0, bottom);
-    p.padLeft = Math.max(0, left);      // clamp ≥ 0 (your rule)
-    p.padRight = Math.max(0, right);
-    layoutPages(pdfDoc);          // recompute vertical bands (top/bottom cascade)
-    computeBox(pdfDoc);                 // recompute box dimensions (incl. new width)
-    syncBox();                          // reposition the box div
-    pdfDoc.rerender();                  // re-render pages at new positions
+    p.padTop = Math.max(0, top); p.padBottom = Math.max(0, bottom);
+    p.padLeft = Math.max(0, left); p.padRight = Math.max(0, right);
+    layoutPages(doc); computeBox(doc); syncBox(); doc.rerender();
   };
 }
 
@@ -787,6 +796,21 @@ function docAtViewCenter(): PdfDoc | null {
   return best;
 }
 
+function findFreeOrigin(): { x: number; y: number } {
+  const st = (window as any).notesAPI.getAppState();
+  const z = st.zoom.value;
+  let cx = (window.innerWidth / 2) / z - st.scrollX;
+  const cy = (window.innerHeight / 2) / z - st.scrollY;
+  let tries = 0;
+  while (tries++ < 50 && pdfDocs.some(d => {
+    const b = d.box;
+    return cx > b.x - 50 && cx < b.x + b.w + 50 && cy > b.y - 50 && cy < b.y + b.h + 50;
+  })) {
+    cx -= 400;   // shift left until clear of existing docs
+  }
+  return { x: cx, y: cy };
+}
+
 // Recompute each page's world-space band from paddings (the cascade).
 function layoutPages(doc: PdfDoc) {
   if (doc.mode === "page") {
@@ -817,11 +841,10 @@ async function mountPdf(file: File) {
 }
 
 async function mountPdfFromBuffer(buf: ArrayBuffer) {
-  // clear the padding handle from any previous document
+  // reset the shared padding handle (it's a singleton; sepEl is per-doc, don't touch it)
   padDragging = false;
   if (padHandle) { padHandle.remove(); padHandle = null; }
   padHandleTarget = null;
-  if (sepLayer) { sepLayer.remove(); sepLayer = null; }
 
   const pdf = await pdfjsLib.getDocument({ data: buf.slice(0) }).promise;
 
@@ -830,7 +853,6 @@ async function mountPdfFromBuffer(buf: ArrayBuffer) {
   el.style.cssText = "position:fixed; inset:0; z-index:0; overflow:hidden; pointer-events:none;";
   document.body.appendChild(el);
 
-  // measure every page (cheap — no render), build canvases
   const pages: LaidPage[] = [];
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
@@ -840,17 +862,18 @@ async function mountPdfFromBuffer(buf: ArrayBuffer) {
     el.appendChild(canvas);
     pages.push({
       index: i, pdfW: vp.width, pdfH: vp.height,
-      padTop: 0, padBottom: 0,
-      padLeft: 0, padRight: 0,
+      padTop: 0, padBottom: 0, padLeft: 0, padRight: 0,
       bandTop: 0, pdfTop: 0, pdfBottom: 0, bandBottom: 0,
       canvas,
     });
   }
 
-    const doc: PdfDoc = {
-    id: "doc_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7),  // ← add
+  const origin = findFreeOrigin();
+
+  const doc: PdfDoc = {
+    id: "doc_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7),
     el, pdf, pages, padWidth: 0,
-    origin: { x: 0, y: 0 },
+    origin,
     box: { x: 0, y: 0, w: 0, h: 0 },
     mode: "full", currentPage: 1,
     bytes: buf,
@@ -899,8 +922,7 @@ async function mountPdfFromBuffer(buf: ArrayBuffer) {
     const pxH = Math.ceil(wh * renderScale);
 
     const off = document.createElement("canvas");
-    off.width = pxW;
-    off.height = pxH;
+    off.width = pxW; off.height = pxH;
     const offCtx = off.getContext("2d")!;
     await page.render({ canvas: off, canvasContext: offCtx, viewport: vp } as any).promise;
 
@@ -914,8 +936,9 @@ async function mountPdfFromBuffer(buf: ArrayBuffer) {
 
     const st2 = (window as any).notesAPI.getAppState();
     const z = st2.zoom.value;
+    const off2 = doc.mode === "scroll" ? (doc.scrollOffset || 0) : 0;
     const sx = Math.round((wx + st2.scrollX) * z);
-    const sy = Math.round((wy + st2.scrollY) * z);
+    const sy = Math.round((wy - off2 + st2.scrollY) * z);
     p.canvas.style.transform = `translate(${sx}px, ${sy}px) scale(${z})`;
   };
 
@@ -958,7 +981,7 @@ function syncPdf() {
       p.canvas.style.transform = `translate(${sx}px, ${sy}px) scale(${zoom})`;
     }
     drawSeparators(doc);
-    applyScrollClip(doc);
+    applyScrollClip();
   }
 }
 
@@ -975,10 +998,9 @@ const HANDLE = 14; // screen px, fixed size so handles stay grabbable at any zoo
 
 function createBox(doc: PdfDoc) {
   const box = document.createElement("div");
-  box.id = "pdf-box";
   box.style.cssText =
     "position:fixed; box-sizing:border-box; border:2px solid #4a90d9; " +
-    "background:transparent; pointer-events:none; z-index:150;" ; // interior click-through
+    "background:transparent; pointer-events:none; z-index:150;";
 
   // a border-only hit area: 4 thin edge strips with pointer-events, leaving interior free
   const mkEdge = (css: string) => {
@@ -1059,7 +1081,7 @@ function repositionBoundStrokes(doc: PdfDoc) {
   api.updateScene({
     elements: api.getSceneElements().map((e: any) => {
       const cd = e.customData;
-      if (cd?.page === undefined || cd.pageX === undefined) return e;
+      if (cd?.docId !== doc.id || cd.pageX === undefined) return e;   // only THIS doc's strokes
       const p = pageById.get(cd.page);
       if (!p) return e;
       return { ...e, x: doc.origin.x + cd.pageX, y: p.bandTop + cd.pageY };
@@ -1130,7 +1152,7 @@ function classifyStroke(el: any) {
         : e),
   });
 
-  if (doc.mode === "scroll") applyScrollInk(doc);
+  if (doc.mode === "scroll") refreshInk();
 }
 
 // Which page's band contains a given world Y? Returns the page or null.
@@ -1157,11 +1179,11 @@ function setMode(doc: PdfDoc, mode: "full" | "page" | "scroll") {
   }
   layoutPages(doc);
   computeBox(doc);
-  applyStrokeVisibility(doc);
+  refreshInk();
   syncBox();
   doc.rerender();
-  applyScrollClip(doc);
-  if (mode === "scroll") applyScrollInk(doc);   // ← moved here, AFTER layout
+  applyScrollClip();
+  if (mode === "scroll") refreshInk();   // ← moved here, AFTER layout
   if (mode === "page") {
     const api = (window as any).notesAPI;
     const st = api.getAppState();
@@ -1181,7 +1203,7 @@ function goToPage(doc: PdfDoc, index: number) {
   doc.currentPage = Math.max(1, Math.min(doc.pages.length, index));
   layoutPages(doc);
   computeBox(doc);
-  applyStrokeVisibility(doc); 
+  refreshInk(); 
   syncBox();
   doc.rerender();
 }
@@ -1191,39 +1213,45 @@ function goToPage(doc: PdfDoc, index: number) {
 
 let strokeStash: any[] = [];   // bound strokes currently hidden (out of scene)
 
-function applyStrokeVisibility(doc: PdfDoc) {
+function refreshInk() {
   const api = (window as any).notesAPI;
-  const pageById = new Map(doc.pages.map(p => [p.index, p]));
-
-  // 1. pool: all bound strokes, whether in-scene or stashed
+  const docById = new Map(pdfDocs.map(d => [d.id, d]));
   const inScene = api.getSceneElements();
-  const boundInScene = inScene.filter((e: any) => e.customData?.page !== undefined);
-  const freeInScene  = inScene.filter((e: any) => e.customData?.page === undefined);
-  const allBound = [...boundInScene, ...strokeStash];
+  const free  = inScene.filter((e: any) => e.customData?.docId === undefined);
+  const bound = inScene.filter((e: any) => e.customData?.docId !== undefined);
+  const pool = [...bound, ...strokeStash];
 
-  // 2. decide visible vs hidden
   const visible: any[] = [];
   const hidden: any[] = [];
-  for (const e of allBound) {
-    const shouldShow = doc.mode === "full" || doc.mode === "scroll" || e.customData.page === doc.currentPage;
-    (shouldShow ? visible : hidden).push(e);
+  for (const e of pool) {
+    const doc = docById.get(e.customData.docId);
+    if (!doc) { hidden.push(e); continue; }                 // doc not loaded → stash (orphan)
+    const p = doc.pages.find(pp => pp.index === e.customData.page);
+    if (!p) { hidden.push(e); continue; }
+    const wx = doc.origin.x + e.customData.pageX;
+
+    if (doc.mode === "scroll" && doc.scrollWindow) {
+      const off = doc.scrollOffset || 0;
+      const w = doc.scrollWindow;
+      const wy = p.bandTop + e.customData.pageY - off;
+      if (wy >= w.y && wy <= w.y + w.h) visible.push({ ...e, x: wx, y: wy });
+      else hidden.push(e);
+    } else if (doc.mode === "page") {
+      if (e.customData.page === doc.currentPage) {
+        visible.push({ ...e, x: wx, y: p.bandTop + e.customData.pageY });
+      } else hidden.push(e);
+    } else { // full
+      visible.push({ ...e, x: wx, y: p.bandTop + e.customData.pageY });
+    }
   }
-
-  // 3. reposition visible strokes to their page's current position (slot in page-mode)
-  const repositioned = visible.map((e: any) => {
-    const p = pageById.get(e.customData.page);
-    if (!p) return e;
-    return { ...e, x: doc.origin.x + e.customData.pageX, y: p.bandTop + e.customData.pageY };
-  });
-
-  strokeStash = hidden;   // stash the rest
-  // scene = free strokes + visible bound strokes (hidden ones are OUT)
-  api.updateScene({ elements: [...freeInScene, ...repositioned] });
+  strokeStash = hidden;
+  api.updateScene({ elements: [...free, ...visible] });
 }
+
 
 // ---- Single reassigned padding handle ----
 let padHandle: HTMLDivElement | null = null;
-let padHandleTarget: { page: LaidPage; side: "top" | "bottom" | "left" | "right" } | null = null;
+let padHandleTarget: { doc: PdfDoc; page: LaidPage; side: "top"|"bottom"|"left"|"right" } | null = null;
 let padDragging = false;
 
 function ensurePadHandle() {
@@ -1248,8 +1276,7 @@ function hidePadHandle() {
 const INSET = 16; // screen px inset for top/bottom handles
 
 function updatePadHandle(clientX: number, clientY: number) {
-  if (!pdfDoc || padDragging) return;
-  const doc = pdfDoc;
+  if (padDragging) return;
   const st = (window as any).notesAPI.getAppState();
   const z = st.zoom.value;
   const wx = clientX / z - st.scrollX;
@@ -1257,28 +1284,35 @@ function updatePadHandle(clientX: number, clientY: number) {
   const bandPx = 24 / z;
   const insetW = INSET / z;
 
+  // find the doc under the pointer (sector early-out via docAtPoint-style check)
+  let doc: PdfDoc | null = null;
+  for (const d of pdfDocs) {
+    const b = d.box;
+    if (wx < b.x - bandPx || wx > b.x + b.w + bandPx) continue;
+    if (wy < b.y - bandPx || wy > b.y + b.h + bandPx) continue;
+    doc = d; break;
+  }
+  if (!doc) { hidePadHandle(); return; }
+
   const pages = doc.mode === "page"
     ? doc.pages.filter(p => p.index === doc.currentPage)
     : doc.pages;
 
-  // gather candidate (page, side, world edge position) with the handle INSET inward
   let best: { p: LaidPage; side: "top"|"bottom"|"left"|"right"; dist: number } | null = null;
   for (const p of pages) {
     const left = doc.origin.x - p.pdfW / 2 - p.padLeft;
     const right = doc.origin.x + p.pdfW / 2 + p.padRight;
     if (wx < left - bandPx || wx > right + bandPx) continue;
     if (wy < p.bandTop - bandPx || wy > p.bandBottom + bandPx) continue;
-
-    // top/bottom handle sit INSET inward from the band edge
     const topHandleY = p.bandTop + insetW;
     const botHandleY = p.bandBottom - insetW;
-    const cand: Array<["top"|"bottom"|"left"|"right", number, number, number]> = [
-      ["top",    doc.origin.x, topHandleY, Math.hypot(wx - doc.origin.x, wy - topHandleY)],
-      ["bottom", doc.origin.x, botHandleY, Math.hypot(wx - doc.origin.x, wy - botHandleY)],
-      ["left",   left,  (p.pdfTop+p.pdfBottom)/2, Math.abs(wx - left) + (wy < p.bandTop || wy > p.bandBottom ? 1e9 : 0)],
-      ["right",  right, (p.pdfTop+p.pdfBottom)/2, Math.abs(wx - right) + (wy < p.bandTop || wy > p.bandBottom ? 1e9 : 0)],
+    const cand: Array<["top"|"bottom"|"left"|"right", number]> = [
+      ["top", Math.hypot(wx - doc.origin.x, wy - topHandleY)],
+      ["bottom", Math.hypot(wx - doc.origin.x, wy - botHandleY)],
+      ["left", Math.abs(wx - left) + (wy < p.bandTop || wy > p.bandBottom ? 1e9 : 0)],
+      ["right", Math.abs(wx - right) + (wy < p.bandTop || wy > p.bandBottom ? 1e9 : 0)],
     ];
-    for (const [side, , , dist] of cand) {
+    for (const [side, dist] of cand) {
       if (dist < bandPx && (!best || dist < best.dist)) best = { p, side, dist };
     }
   }
@@ -1289,7 +1323,7 @@ function updatePadHandle(clientX: number, clientY: number) {
 
 function showPadHandleAt(doc: PdfDoc, p: LaidPage, side: string, z: number, st: any) {
   const h = ensurePadHandle();
-  padHandleTarget = { page: p, side: side as any };
+  padHandleTarget = { doc, page: p, side: side as any };
   const left = doc.origin.x - p.pdfW / 2 - p.padLeft;
   const right = doc.origin.x + p.pdfW / 2 + p.padRight;
   const cx = doc.origin.x;
@@ -1314,11 +1348,10 @@ function showPadHandleAt(doc: PdfDoc, p: LaidPage, side: string, z: number, st: 
 }
 
 function startPadDrag(e: PointerEvent) {
-  if (!pdfDoc || !padHandleTarget) return;
+  if (!padHandleTarget) return;
   e.preventDefault(); e.stopPropagation();
   padDragging = true;
-  const doc = pdfDoc;
-  const { page, side } = padHandleTarget;
+  const { doc, page, side } = padHandleTarget;   // ← doc from target
   const startPad = { top: page.padTop, bottom: page.padBottom, left: page.padLeft, right: page.padRight };
   const z = (window as any).notesAPI.getAppState().zoom.value;
   const sx = e.clientX, sy = e.clientY;
@@ -1330,23 +1363,21 @@ function startPadDrag(e: PointerEvent) {
   const move = (ev: PointerEvent) => {
     const dx = (ev.clientX - sx) / z;
     const dy = (ev.clientY - sy) / z;
-    // dragging outward grows the padding on that side
     if (side === "top") {
       const isFirst = page.index === Math.min(...doc.pages.map(p => p.index));
       page.padTop = Math.max(0, isFirst ? startPad.top - dy : startPad.top + dy);
     }
-    if (side === "bottom") page.padBottom = Math.max(0, startPad.bottom + dy); // down = grow
-    if (side === "left")   page.padLeft   = Math.max(0, startPad.left - dx);   // left = grow
-    if (side === "right")  page.padRight  = Math.max(0, startPad.right + dx);  // right = grow
+    if (side === "bottom") page.padBottom = Math.max(0, startPad.bottom + dy);
+    if (side === "left")   page.padLeft   = Math.max(0, startPad.left - dx);
+    if (side === "right")  page.padRight  = Math.max(0, startPad.right + dx);
     layoutPages(doc);
     computeBox(doc);
     syncBox();
     doc.rerender();
-    // keep the handle glued to the moving edge
     const st = (window as any).notesAPI.getAppState();
     showPadHandleAt(doc, page, side, st.zoom.value, st);
   };
-  const up = (ev: PointerEvent) => {
+  const up = () => {
     padDragging = false;
     shield.removeEventListener("pointermove", move);
     shield.removeEventListener("pointerup", up);
@@ -1396,54 +1427,17 @@ function drawSeparators(doc: PdfDoc) {
 }
 
 function applyScrollClip() {
-  for (const doc of pdfDocs) 
-  {
-    if (!doc.el) return;
-    if (doc.mode !== "scroll" || !doc.scrollWindow) {
-      doc.el.style.clipPath = "";   // no clip in other modes
-      return;
-    }
-    const st = (window as any).notesAPI.getAppState();
-    const z = st.zoom.value;
+  const st = (window as any).notesAPI.getAppState();
+  const z = st.zoom.value;
+  for (const doc of pdfDocs) {
+    if (!doc.el) continue;
+    if (doc.mode !== "scroll" || !doc.scrollWindow) { doc.el.style.clipPath = ""; continue; }
     const w = doc.scrollWindow;
     const sx = (w.x + st.scrollX) * z;
     const sy = (w.y + st.scrollY) * z;
     const sw = w.w * z, sh = w.h * z;
-    // clip the pdf-layer to the window's screen rect
     doc.el.style.clipPath = `inset(${sy}px calc(100% - ${sx + sw}px) calc(100% - ${sy + sh}px) ${sx}px)`;
   }
-}
-
-function applyScrollInk(doc: PdfDoc) {
-  if (doc.mode !== "scroll" || !doc.scrollWindow) return;
-  const api = (window as any).notesAPI;
-  const off = doc.scrollOffset || 0;
-  const w = doc.scrollWindow;
-  const pageById = new Map(doc.pages.map(p => [p.index, p]));
-
-  const inScene = api.getSceneElements();
-  const bound = inScene.filter((e: any) => e.customData?.page !== undefined);
-  const free  = inScene.filter((e: any) => e.customData?.page === undefined);
-  const pool = [...bound, ...strokeStash];
-
-  const visible: any[] = [];
-  const hidden: any[] = [];
-  for (const e of pool) {
-    const p = pageById.get(e.customData.page);
-    if (!p) { hidden.push(e); continue; }
-    // stroke's scroll-mode world position (shifted up by offset, like the PDF)
-    const wy = p.bandTop + e.customData.pageY - off;
-    const wx = doc.origin.x + e.customData.pageX;
-    // visible only if within the window's world Y-range (rough: use stroke top)
-    const inWindow = wy >= w.y && wy <= w.y + w.h;
-    if (inWindow) {
-      visible.push({ ...e, x: wx, y: wy });
-    } else {
-      hidden.push(e);
-    }
-  }
-  strokeStash = hidden;
-  api.updateScene({ elements: [...free, ...visible] });
 }
 
 // ---- Stroke finalize: pressure remap + rounding + thinning ----
