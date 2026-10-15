@@ -62,25 +62,18 @@ async function ensurePdfUploaded(doc: PdfDoc): Promise<string> {
   return out.hash;
 }
 
-async function loadNote(name: string) {
+// Load a scene object (from any source) onto the canvas.
+async function loadScene(scene: any) {
   const api = (window as any).notesAPI;
   strokeStash = [];
-
-  // tear down ALL existing docs first (loading replaces the whole canvas)
   teardownAllDocs();
 
-  const res = await fetch(API_BASE + "/load.php?name=" + encodeURIComponent(name));
-  if (!res.ok) throw new Error("load failed: " + res.status);
-  const scene = await res.json();
-
-  // support both new (pdfs[]) and old (pdf) saved formats
   const pdfList = scene.pdfs || (scene.pdf ? [{ ...scene.pdf, id: null }] : []);
-
   for (const sp of pdfList) {
     await mountPdfFromHash(sp.hash);
-    const doc = pdfDocs[pdfDocs.length - 1];   // the one just mounted
+    const doc = pdfDocs[pdfDocs.length - 1];
     if (!doc) continue;
-    if (sp.id) doc.id = sp.id;                  // ← restore saved id so strokes route
+    if (sp.id) doc.id = sp.id;
     doc.origin = sp.origin;
     doc.mode = sp.mode;
     doc.currentPage = sp.currentPage;
@@ -97,7 +90,6 @@ async function loadNote(name: string) {
   }
   syncBox();
 
-  // restore elements (bound + free)
   api.updateScene({
     elements: scene.elements,
     appState: { ...api.getAppState(), ...scene.appState },
@@ -107,8 +99,7 @@ async function loadNote(name: string) {
   const imgEls = scene.elements.filter((e: any) => e.type === "image" && e.customData?.imgHash);
   for (const el of imgEls) {
     try {
-      const h = el.customData.imgHash;
-      const r = await fetch(API_BASE + "/imgload.php?hash=" + h);
+      const r = await fetch(API_BASE + "/imgload.php?hash=" + el.customData.imgHash);
       if (!r.ok) continue;
       const blob = await r.blob();
       const dataURL = await new Promise<string>((res) => {
@@ -117,9 +108,31 @@ async function loadNote(name: string) {
       api.addFiles([{ id: el.fileId, dataURL, mimeType: el.customData.imgMime || "image/png", created: Date.now() }]);
     } catch {}
   }
-  api.updateScene({ elements: api.getSceneElements() });  // refresh so images render
+  api.updateScene({ elements: api.getSceneElements() });
 
-  refreshInk();   // position/stash bound strokes per each doc's mode
+  refreshInk();
+}
+
+// Fetch a named note and load it; then check for a newer autosave.
+async function loadNote(name: string) {
+  const res = await fetch(API_BASE + "/load.php?name=" + encodeURIComponent(name));
+  if (!res.ok) throw new Error("load failed: " + res.status);
+  const scene = await res.json();
+  await loadScene(scene);
+
+  // newer-autosave check
+  try {
+    const asName = name + "__autosave";
+    const rows = await searchNotes(name);
+    const noteRow = rows.find((x: any) => x.name === name);
+    const asRow = rows.find((x: any) => x.name === asName);
+    if (noteRow && asRow && asRow.updated_at > noteRow.updated_at) {
+      if (confirm("A newer autosave exists for this note. Restore it?")) {
+        const r = await fetch(API_BASE + "/load.php?name=" + encodeURIComponent(asName));
+        if (r.ok) await loadScene(await r.json());
+      }
+    }
+  } catch {}
 }
 
 function teardownAllDocs() {
@@ -137,6 +150,25 @@ function teardownAllDocs() {
 async function searchNotes(q: string) {
   const res = await fetch(API_BASE + "/search.php?q=" + encodeURIComponent(q));
   return res.json(); // [{name, updated_at}, ...]
+}
+
+// Build { folders: Set<string>, files: {name, full, updated_at}[] } for a given path prefix.
+function listFolder(allRows: any[], prefix: string) {
+  // prefix "" = root, "Math/" = inside Math
+  const folders = new Set<string>();
+  const files: any[] = [];
+  for (const row of allRows) {
+    if (row.name.endsWith("__autosave")) continue;
+    if (!row.name.startsWith(prefix)) continue;
+    const rest = row.name.slice(prefix.length);   // part after the prefix
+    const slash = rest.indexOf("/");
+    if (slash === -1) {
+      files.push({ label: rest, full: row.name, updated_at: row.updated_at });  // a file here
+    } else {
+      folders.add(rest.slice(0, slash));          // a subfolder
+    }
+  }
+  return { folders: [...folders].sort(), files: files.sort((a,b)=>a.label.localeCompare(b.label)) };
 }
 
 export function initNotesPanel() {
@@ -223,59 +255,127 @@ export function initNotesPanel() {
   }
 
   let currentName = "";                       // last saved/loaded note
+
+  let lastSavedSig = "";
+  function sceneSignature(): string {
+    const a = (window as any).notesAPI;
+    return JSON.stringify(a.getSceneElements().map((e: any) => [e.id, e.x, e.y, e.version]));
+  }
+  async function doAutosave() {
+    if (!currentName) return;
+    const sig = sceneSignature();
+    if (sig === lastSavedSig) return;
+    try { await saveNote(currentName + "__autosave"); lastSavedSig = sig; } catch {}
+  }
+  setInterval(doAutosave, 20000);
+
   let linkTarget: { note: string; ids: string[] } | null = null;
   const api = () => (window as any).notesAPI;
   const selectedIds = () => Object.keys(api().getAppState().selectedElementIds || {});
 
   // SAVE — popup asks for name
-  function openSaveDialog() {
+    function openSaveDialog() {
     const { box, close } = makeDialog();
+    // default folder = the folder of the current note, if any
+    const curFolder = currentName.includes("/") ? currentName.slice(0, currentName.lastIndexOf("/") + 1) : "";
     box.innerHTML = `
       <h3>Save note</h3>
-      <input class="np-d-name" placeholder="MATH1/Lecture 1" />
+      <div style="font-size:12px; color:var(--text-secondary-color,#888);">Folder: <span class="np-folder">${curFolder || "root"}</span></div>
+      <input class="np-d-name" placeholder="Name  (or Sub/Name to make a subfolder)" />
       <div class="np-dialog-actions">
-        <button class="np-d-cancel">Cancel</button>
+        <button class="np-d-browse">Change folder…</button>
         <button class="np-d-ok">Save</button>
       </div>`;
+    let folder = curFolder;
+    const folderSpan = box.querySelector(".np-folder") as HTMLElement;
     const input = box.querySelector(".np-d-name") as HTMLInputElement;
-    input.value = currentName;
-    input.focus();
-    input.select();
+    // prefill with current filename (without folder)
+    input.value = currentName ? currentName.slice(currentName.lastIndexOf("/") + 1) : "";
+    input.focus(); input.select();
+
     const doIt = async () => {
-      const name = input.value.trim();
-      if (!name) return;
-      try { await saveNote(name); currentName = name; toast("saved ✓"); close(); }
+      const typed = input.value.trim();
+      if (!typed) return;
+      const full = folder + typed;   // folder already ends in "/" or is ""
+      try { await saveNote(full); currentName = full; lastSavedSig = sceneSignature(); toast("saved ✓"); close(); }
       catch { toast("save failed"); }
     };
     box.querySelector(".np-d-ok")!.addEventListener("click", doIt);
-    box.querySelector(".np-d-cancel")!.addEventListener("click", close);
     input.addEventListener("keydown", (e) => { if (e.key === "Enter") doIt(); });
+
+    // "Change folder…" opens a mini folder-picker
+    box.querySelector(".np-d-browse")!.addEventListener("click", async () => {
+      const allRows = await searchNotes("");
+      // simple prompt-based picker for now: show folders, let user pick or type
+      const folders = new Set<string>([""]);
+      for (const r of allRows) {
+        if (r.name.endsWith("__autosave")) continue;
+        const parts = r.name.split("/"); parts.pop();  // drop filename
+        let acc = "";
+        for (const p of parts) { acc += p + "/"; folders.add(acc); }
+      }
+      const picked = prompt("Folder (end with / , blank = root):\nExisting:\n" + [...folders].sort().join("\n"), folder);
+      if (picked !== null) { folder = picked.trim(); if (folder && !folder.endsWith("/")) folder += "/"; folderSpan.textContent = folder || "root"; }
+    });
   }
 
   // LOAD — popup with search + scrollable list
-  function openLoadDialog() {
+    function openLoadDialog() {
     const { box, close } = makeDialog();
     box.innerHTML = `
       <h3>Load note</h3>
-      <input class="np-d-search" placeholder="Search…" />
+      <div class="np-crumbs" style="font-size:12px; color:var(--text-secondary-color,#888); min-height:16px;"></div>
+      <div style="display:flex; gap:6px;">
+        <input class="np-d-search" placeholder="Search all…" style="flex:1;" />
+        <button class="np-d-new">+ New</button>
+      </div>
       <div class="np-dialog-list"></div>`;
     const search = box.querySelector(".np-d-search") as HTMLInputElement;
     const list = box.querySelector(".np-dialog-list") as HTMLDivElement;
-    search.focus();
-    let timer: any;
-    const refresh = async (q: string) => {
-      const rows = await searchNotes(q);
+    const crumbs = box.querySelector(".np-crumbs") as HTMLDivElement;
+    box.querySelector(".np-d-new")!.addEventListener("click", () => {
+      if (!confirm("Start a new blank note? (unsaved changes lost)")) return;
+      teardownAllDocs(); strokeStash = [];
+      (window as any).notesAPI.updateScene({ elements: [] });
+      currentName = ""; lastSavedSig = ""; close();
+      toast("new note — Save to name it");
+    });
+
+    let path = "";          // current folder prefix, e.g. "Math/"
+    let allRows: any[] = [];
+
+    const render = () => {
+      // breadcrumb
+      const parts = path ? path.slice(0, -1).split("/") : [];
+      crumbs.innerHTML = `<span class="np-crumb" data-p="">root</span>` +
+        parts.map((p, i) => ` / <span class="np-crumb" data-p="${parts.slice(0,i+1).join("/")}/">${p}</span>`).join("");
+      crumbs.querySelectorAll(".np-crumb").forEach((c) =>
+        c.addEventListener("click", () => { path = (c as HTMLElement).dataset.p || ""; render(); }));
+      (crumbs.querySelectorAll(".np-crumb") as any).forEach((c: HTMLElement) => c.style.cssText = "cursor:pointer; text-decoration:underline;");
+
+      const { folders, files } = listFolder(allRows, path);
       list.innerHTML = "";
-      if (!rows.length) { list.innerHTML = `<div class="np-item" style="color:var(--text-secondary-color,#888)">no notes</div>`; return; }
-            for (const row of rows) {
+      if (!folders.length && !files.length) {
+        list.innerHTML = `<div class="np-item" style="color:var(--text-secondary-color,#888)">empty</div>`;
+      }
+      // folders first
+      for (const f of folders) {
+        const item = document.createElement("div");
+        item.className = "np-item";
+        item.textContent = "📁 " + f;
+        item.addEventListener("click", () => { path = path + f + "/"; render(); });
+        list.appendChild(item);
+      }
+      // then files
+      for (const file of files) {
         const item = document.createElement("div");
         item.className = "np-item";
         item.style.cssText = "display:flex; justify-content:space-between; align-items:center;";
         const label = document.createElement("span");
-        label.textContent = row.name;
+        label.textContent = "📄 " + file.label;
         label.style.cssText = "flex:1; cursor:pointer;";
         label.addEventListener("click", async () => {
-          try { await loadNote(row.name); currentName = row.name; toast("loaded ✓"); updateFlipButtons(); close(); }
+          try { await loadNote(file.full); currentName = file.full; lastSavedSig = sceneSignature(); toast("loaded ✓"); updateFlipButtons(); close(); }
           catch { toast("load failed"); }
         });
         const del = document.createElement("button");
@@ -283,18 +383,41 @@ export function initNotesPanel() {
         del.style.cssText = "border:none; background:none; cursor:pointer; font-size:14px;";
         del.addEventListener("click", async (ev) => {
           ev.stopPropagation();
-          if (!confirm(`Delete "${row.name}"?`)) return;
-          await fetch(API_BASE + "/notedelete.php?name=" + encodeURIComponent(row.name));
-          toast("deleted");
-          refresh(search.value);  // refresh the list
+          if (!confirm(`Delete "${file.full}"?`)) return;
+          await fetch(API_BASE + "/notedelete.php?name=" + encodeURIComponent(file.full));
+          toast("deleted"); await reload();
         });
-        item.appendChild(label);
-        item.appendChild(del);
+        item.appendChild(label); item.appendChild(del);
         list.appendChild(item);
       }
     };
-    search.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(() => refresh(search.value), 200); });
-    refresh("");
+
+    const reload = async () => { allRows = await searchNotes(""); render(); };
+
+    // search: when there's a query, show flat matching files across everything
+    let timer: any;
+    search.addEventListener("input", () => {
+      clearTimeout(timer);
+      timer = setTimeout(async () => {
+        const q = search.value.trim();
+        if (!q) { await reload(); return; }
+        const rows = (await searchNotes(q)).filter((r: any) => !r.name.endsWith("__autosave"));
+        crumbs.textContent = `search: "${q}"`;
+        list.innerHTML = "";
+        for (const row of rows) {
+          const item = document.createElement("div");
+          item.className = "np-item"; item.textContent = "📄 " + row.name;
+          item.style.cursor = "pointer";
+          item.addEventListener("click", async () => {
+            try { await loadNote(row.name); currentName = row.name; lastSavedSig = sceneSignature(); toast("loaded ✓"); updateFlipButtons(); close(); }
+            catch { toast("load failed"); }
+          });
+          list.appendChild(item);
+        }
+      }, 200);
+    });
+
+    reload();
   }
 
   // SET TARGET / LINK — act on selection, no popup
