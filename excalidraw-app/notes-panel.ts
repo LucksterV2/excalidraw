@@ -45,6 +45,21 @@ async function saveNote(name: string) {
     appState: { viewBackgroundColor: api.getAppState().viewBackgroundColor },
     pdfs,   // ← array (was singular `pdf`)
   };
+
+    // extract tags for the search index
+  const tags: any[] = [];
+  for (const e of elements) {
+    const ts = (e as any).customData?.tags;
+    if (Array.isArray(ts)) for (const t of ts) tags.push({ elementId: e.id, text: t });
+  }
+  // don't index autosave shadows
+  if (!name.endsWith("__autosave")) {
+    fetch(API_BASE + "/tagsave.php", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note: name, tags }),
+    }).catch(()=>{});
+  }
+
   const res = await fetch(API_BASE + "/save.php", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -182,6 +197,7 @@ export function initNotesPanel() {
     <button id="np-load"   title="Load">📂</button>
     <button id="np-target" title="Set target">🎯</button>
     <button id="np-link"   title="Link to target">🔗</button>
+    <button id="np-tag" title="Tags">🏷️</button>
     <button id="np-pdf"    title="Add PDF">📎</button>
     <button id="np-export" title="Export backup">⬇️</button>
     <button id="np-compact" title="Compact note">🗜️</button>
@@ -420,6 +436,101 @@ export function initNotesPanel() {
     reload();
   }
 
+    // TAG dialog — manage tags on the current selection
+  function openTagDialog() {
+    const api = (window as any).notesAPI;
+    const ids = Object.keys(api.getAppState().selectedElementIds || {});
+    const { box, close } = makeDialog();
+    box.innerHTML = `
+      <h3>Tags</h3>
+      <div class="np-tag-cur" style="font-size:12px; color:var(--text-secondary-color,#888);"></div>
+      <div style="display:flex; gap:6px;">
+        <input class="np-tag-input" placeholder="${ids.length ? 'add tag to selection…' : 'select elements to tag'}" style="flex:1;" ${ids.length?'':'disabled'} />
+        <button class="np-tag-add" ${ids.length?'':'disabled'}>Add</button>
+      </div>
+      <hr style="border:none;border-top:1px solid var(--default-border-color,#ddd);margin:4px 0;">
+      <input class="np-tag-search" placeholder="🔍 search all tags…" />
+      <div class="np-dialog-list np-tag-results"></div>`;
+    const curDiv = box.querySelector(".np-tag-cur") as HTMLElement;
+    const addInput = box.querySelector(".np-tag-input") as HTMLInputElement;
+    const searchInput = box.querySelector(".np-tag-search") as HTMLInputElement;
+    const results = box.querySelector(".np-tag-results") as HTMLDivElement;
+
+    // show existing tags on the selection
+    const showCurrent = () => {
+      const sel = api.getSceneElements().filter((e: any) => ids.includes(e.id));
+      const all = new Set<string>();
+      for (const e of sel) (e.customData?.tags || []).forEach((t: string) => all.add(t));
+      curDiv.innerHTML = ids.length
+        ? (all.size ? "current: " + [...all].map(t => `<span class="np-tagchip" data-t="${t}" style="background:var(--button-bg,#eee);padding:1px 6px;border-radius:8px;margin:2px;cursor:pointer;" title="click to remove">${t} ✕</span>`).join("") : "no tags on selection")
+        : "";
+      curDiv.querySelectorAll(".np-tagchip").forEach(c => c.addEventListener("click", () => {
+        const t = (c as HTMLElement).dataset.t!;
+        api.updateScene({ elements: api.getSceneElements().map((e: any) =>
+          ids.includes(e.id) ? { ...e, customData: { ...e.customData, tags: (e.customData?.tags||[]).filter((x:string)=>x!==t) } } : e) });
+        showCurrent();
+        if (currentName) saveNote(currentName).catch(()=>{});
+      }));
+    };
+    showCurrent();
+
+    const addTag = () => {
+      const t = addInput.value.trim();
+      if (!t || !ids.length) return;
+      if (!currentName) { toast("save the note first — tags need a named note"); return; }
+      api.updateScene({ elements: api.getSceneElements().map((e: any) =>
+        ids.includes(e.id) ? { ...e, customData: { ...e.customData, tags: [...new Set([...(e.customData?.tags||[]), t])] } } : e) });
+      addInput.value = "";
+      showCurrent();
+      saveNote(currentName).catch(()=>{});
+      toast("tagged");
+    };
+    box.querySelector(".np-tag-add")!.addEventListener("click", addTag);
+    addInput.addEventListener("keydown", (e) => { if (e.key === "Enter") addTag(); });
+
+    // search
+    let timer: any;
+    searchInput.addEventListener("input", () => {
+      clearTimeout(timer);
+      timer = setTimeout(async () => {
+        const q = searchInput.value.trim();
+        results.innerHTML = "";
+        if (!q) return;
+        const rows = await (await fetch(API_BASE + "/tagsearch.php?q=" + encodeURIComponent(q))).json();
+        if (!rows.length) { results.innerHTML = `<div class="np-item" style="color:var(--text-secondary-color,#888)">no matches</div>`; return; }
+        for (const row of rows) {
+          const item = document.createElement("div");
+          item.className = "np-item";
+          item.style.cssText = "display:flex;justify-content:space-between;align-items:center;gap:6px;";
+          const lbl = document.createElement("span");
+          lbl.style.cssText = "flex:1;cursor:pointer;";
+          lbl.innerHTML = `<b>${row.text}</b> <span style="color:var(--text-secondary-color,#888);font-size:12px;">${row.note}</span>`;
+          // default: open popup (peek). shift/opt or the ⤢ button = jump.
+          lbl.addEventListener("click", () => { openTagResult(row, false); close(); });
+          const jump = document.createElement("button");
+          jump.textContent = "↪"; jump.title = "jump to it (replace canvas)";
+          jump.style.cssText = "border:none;background:none;cursor:pointer;";
+          jump.addEventListener("click", (ev) => { ev.stopPropagation(); openTagResult(row, true); close(); });
+          item.appendChild(lbl); item.appendChild(jump);
+          results.appendChild(item);
+        }
+      }, 200);
+    });
+    searchInput.focus();
+  }
+
+  async function openTagResult(row: any, jump: boolean) {
+    if (jump) {
+      await loadNote(row.note);
+      currentName = row.note; lastSavedSig = sceneSignature(); updateFlipButtons();
+      const api = (window as any).notesAPI;
+      const el = api.getSceneElements().find((e: any) => e.id === row.elementId);
+      if (el) api.setViewport({ target: [el], fit: "scale-down", animation: true });
+    } else {
+      (window as any).openNotePopup(row.note, [row.elementId]);   // popup framed on the tagged element
+    }
+  }
+
   // SET TARGET / LINK — act on selection, no popup
   function doSetTarget() {
     const ids = selectedIds();
@@ -447,6 +558,7 @@ export function initNotesPanel() {
   panel.querySelector("#np-load")!.addEventListener("click", openLoadDialog);
   panel.querySelector("#np-target")!.addEventListener("click", doSetTarget);
   panel.querySelector("#np-link")!.addEventListener("click", doLink);
+  panel.querySelector("#np-tag")!.addEventListener("click", openTagDialog);
   panel.querySelector("#np-pdf")!.addEventListener("click", () => {
     const inp = document.createElement("input");
     inp.type = "file";
