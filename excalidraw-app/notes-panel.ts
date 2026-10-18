@@ -46,7 +46,7 @@ async function saveNote(name: string) {
     pdfs,   // ← array (was singular `pdf`)
   };
 
-    // extract tags for the search index
+  // extract tags for the search index
   const tags: any[] = [];
   for (const e of elements) {
     const ts = (e as any).customData?.tags;
@@ -57,6 +57,19 @@ async function saveNote(name: string) {
     fetch(API_BASE + "/tagsave.php", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ note: name, tags }),
+    }).catch(()=>{});
+  }
+
+  // extract links for the index
+  const links: any[] = [];
+  for (const e of elements) {
+    const nl = (e as any).customData?.noteLink;
+    if (nl?.note) links.push({ sourceElementId: e.id, targetNote: nl.note });
+  }
+  if (!name.endsWith("__autosave")) {
+    fetch(API_BASE + "/linksave.php", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note: name, links }),
     }).catch(()=>{});
   }
 
@@ -165,6 +178,37 @@ function teardownAllDocs() {
 async function searchNotes(q: string) {
   const res = await fetch(API_BASE + "/search.php?q=" + encodeURIComponent(q));
   return res.json(); // [{name, updated_at}, ...]
+}
+
+async function renameNote(oldName: string, newName: string): Promise<boolean> {
+  const res = await fetch(API_BASE + "/rename.php?old=" + encodeURIComponent(oldName) + "&new=" + encodeURIComponent(newName));
+  const out = await res.json();
+  if (!out.ok) return false;
+
+  // rewrite customData.noteLink.note in every note that linked to oldName
+  for (const srcNote of (out.inbound || [])) {
+    const nm = srcNote === oldName ? newName : srcNote;   // (self-links: already renamed)
+    try {
+      const r = await fetch(API_BASE + "/load.php?name=" + encodeURIComponent(nm));
+      if (!r.ok) continue;
+      const scene = await r.json();
+      let changed = false;
+      scene.elements = scene.elements.map((e: any) => {
+        if (e.customData?.noteLink?.note === oldName) {
+          changed = true;
+          return { ...e, customData: { ...e.customData, noteLink: { ...e.customData.noteLink, note: newName } } };
+        }
+        return e;
+      });
+      if (changed) {
+        await fetch(API_BASE + "/save.php", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: nm, json: JSON.stringify(scene) }),
+        });
+      }
+    } catch {}
+  }
+  return true;
 }
 
 // Build { folders: Set<string>, files: {name, full, updated_at}[] } for a given path prefix.
@@ -403,7 +447,24 @@ export function initNotesPanel() {
           await fetch(API_BASE + "/notedelete.php?name=" + encodeURIComponent(file.full));
           toast("deleted"); await reload();
         });
-        item.appendChild(label); item.appendChild(del);
+        const ren = document.createElement("button");
+        ren.textContent = "✏️";
+        ren.style.cssText = "border:none; background:none; cursor:pointer; font-size:13px;";
+        ren.addEventListener("click", async (ev) => {
+          ev.stopPropagation();
+          const nn = prompt("New name / path:", file.full);
+          if (!nn || nn === file.full) return;
+          const wasOpen = currentName === file.full;
+          const ok = await renameNote(file.full, nn.trim());
+          toast(ok ? "renamed" : "rename failed");
+          if (wasOpen && ok) {
+            await loadNote(nn.trim());           // reload the renamed note fresh
+            currentName = nn.trim();
+            updateFlipButtons();
+          }
+          await reload();
+        });
+        item.appendChild(label); item.appendChild(ren); item.appendChild(del);
         list.appendChild(item);
       }
     };
