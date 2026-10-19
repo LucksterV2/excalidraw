@@ -314,8 +314,13 @@ export function initNotesPanel() {
     return { box, close };
   }
 
-  (window as any).__setCurrentName = (n: string) => { currentName = n; lastSavedSig = sceneSignature(); };
-  let currentName = "";                       // last saved/loaded note
+  (window as any).__setCurrentName = (n: string) => { setCurrentName(n); lastSavedSig = sceneSignature(); };
+  let currentName = localStorage.getItem("notes_currentName") || "";
+  function setCurrentName(name: string) {
+    currentName = name;
+    if (name) localStorage.setItem("notes_currentName", name);
+    else localStorage.removeItem("notes_currentName");
+  }
 
   let lastSavedSig = "";
   function sceneSignature(): string {
@@ -358,7 +363,7 @@ export function initNotesPanel() {
       const typed = input.value.trim();
       if (!typed) return;
       const full = folder + typed;   // folder already ends in "/" or is ""
-      try { await saveNote(full); currentName = full; lastSavedSig = sceneSignature(); toast("saved ✓"); close(); }
+      try { await saveNote(full); setCurrentName(full); lastSavedSig = sceneSignature(); toast("saved ✓"); close(); }
       catch { toast("save failed"); }
     };
     box.querySelector(".np-d-ok")!.addEventListener("click", doIt);
@@ -398,7 +403,7 @@ export function initNotesPanel() {
       if (!confirm("Start a new blank note? (unsaved changes lost)")) return;
       teardownAllDocs(); strokeStash = [];
       (window as any).notesAPI.updateScene({ elements: [] });
-      currentName = ""; lastSavedSig = ""; close();
+      setCurrentName(""); lastSavedSig = ""; close();
       toast("new note — Save to name it");
     });
 
@@ -436,7 +441,7 @@ export function initNotesPanel() {
         label.textContent = "📄 " + file.label;
         label.style.cssText = "flex:1; cursor:pointer;";
         label.addEventListener("click", async () => {
-          try { await loadNote(file.full); currentName = file.full; lastSavedSig = sceneSignature(); toast("loaded ✓"); updateFlipButtons(); close(); }
+          try { await loadNote(file.full); setCurrentName(file.full); lastSavedSig = sceneSignature(); toast("loaded ✓"); updateFlipButtons(); close(); }
           catch { toast("load failed"); }
         });
         const del = document.createElement("button");
@@ -460,7 +465,7 @@ export function initNotesPanel() {
           toast(ok ? "renamed" : "rename failed");
           if (wasOpen && ok) {
             await loadNote(nn.trim());           // reload the renamed note fresh
-            currentName = nn.trim();
+            setCurrentName(nn.trim());
             updateFlipButtons();
           }
           await reload();
@@ -487,7 +492,7 @@ export function initNotesPanel() {
           item.className = "np-item"; item.textContent = "📄 " + row.name;
           item.style.cursor = "pointer";
           item.addEventListener("click", async () => {
-            try { await loadNote(row.name); currentName = row.name; lastSavedSig = sceneSignature(); toast("loaded ✓"); updateFlipButtons(); close(); }
+            try { await loadNote(row.name); setCurrentName(row.name); lastSavedSig = sceneSignature(); toast("loaded ✓"); updateFlipButtons(); close(); }
             catch { toast("load failed"); }
           });
           list.appendChild(item);
@@ -584,7 +589,7 @@ export function initNotesPanel() {
   async function openTagResult(row: any, jump: boolean) {
     if (jump) {
       await loadNote(row.note);
-      currentName = row.note; lastSavedSig = sceneSignature(); updateFlipButtons();
+      setCurrentName(row.note); lastSavedSig = sceneSignature(); updateFlipButtons();
       const api = (window as any).notesAPI;
       const el = api.getSceneElements().find((e: any) => e.id === row.elementId);
       if (el) api.setViewport({ target: [el], fit: "scale-down", animation: true });
@@ -1000,7 +1005,11 @@ function PopupCanvas(props: { scene: any; targetIds: string[] }) {
   return React.createElement(Excalidraw, {
     initialData: {
       elements: props.scene.elements,
-      appState: props.scene.appState,
+      appState: {
+        ...props.scene.appState,
+        theme: (window as any).notesAPI?.getAppState?.().theme || "dark",
+        viewBackgroundColor: (window as any).notesAPI?.getAppState?.().viewBackgroundColor || "#121212",
+      },
     },
     viewModeEnabled: true,
   });
