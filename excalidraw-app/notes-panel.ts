@@ -314,6 +314,7 @@ export function initNotesPanel() {
     return { box, close };
   }
 
+  (window as any).__setCurrentName = (n: string) => { currentName = n; lastSavedSig = sceneSignature(); };
   let currentName = "";                       // last saved/loaded note
 
   let lastSavedSig = "";
@@ -1044,6 +1045,7 @@ export async function openNotePopup(noteName: string, targetIds: string[] = []) 
   popup.querySelector(".note-popup-max")!.addEventListener("click", async () => {
     root.unmount(); popup.remove();
     await loadNote(noteName);
+    (window as any).__setCurrentName?.(noteName);   // ← sync currentName to the loaded note
     const api = (window as any).notesAPI;
     const targets = api.getSceneElements().filter((el: any) => targetIds.includes(el.id));
         if (targets.length) api.setViewport({ target: targets, fit: "scale-down", animation: false });
