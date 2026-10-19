@@ -340,13 +340,14 @@ export function initNotesPanel() {
   const selectedIds = () => Object.keys(api().getAppState().selectedElementIds || {});
 
   // SAVE — popup asks for name
-    function openSaveDialog() {
+  function openSaveDialog() {
     const { box, close } = makeDialog();
-    // default folder = the folder of the current note, if any
     const curFolder = currentName.includes("/") ? currentName.slice(0, currentName.lastIndexOf("/") + 1) : "";
     box.innerHTML = `
       <h3>Save note</h3>
       <div style="font-size:12px; color:var(--text-secondary-color,#888);">Folder: <span class="np-folder">${curFolder || "root"}</span></div>
+      <div class="np-save-crumbs" style="font-size:12px; color:var(--text-secondary-color,#888); min-height:16px; display:none;"></div>
+      <div class="np-save-folders np-dialog-list" style="display:none; max-height:160px;"></div>
       <input class="np-d-name" placeholder="Name  (or Sub/Name to make a subfolder)" />
       <div class="np-dialog-actions">
         <button class="np-d-browse">Change folder…</button>
@@ -354,34 +355,61 @@ export function initNotesPanel() {
       </div>`;
     let folder = curFolder;
     const folderSpan = box.querySelector(".np-folder") as HTMLElement;
+    const crumbs = box.querySelector(".np-save-crumbs") as HTMLElement;
+    const folderList = box.querySelector(".np-save-folders") as HTMLDivElement;
     const input = box.querySelector(".np-d-name") as HTMLInputElement;
-    // prefill with current filename (without folder)
     input.value = currentName ? currentName.slice(currentName.lastIndexOf("/") + 1) : "";
     input.focus(); input.select();
 
     const doIt = async () => {
       const typed = input.value.trim();
       if (!typed) return;
-      const full = folder + typed;   // folder already ends in "/" or is ""
+      const full = folder + typed;
       try { await saveNote(full); setCurrentName(full); lastSavedSig = sceneSignature(); toast("saved ✓"); close(); }
       catch { toast("save failed"); }
     };
     box.querySelector(".np-d-ok")!.addEventListener("click", doIt);
     input.addEventListener("keydown", (e) => { if (e.key === "Enter") doIt(); });
 
-    // "Change folder…" opens a mini folder-picker
-    box.querySelector(".np-d-browse")!.addEventListener("click", async () => {
-      const allRows = await searchNotes("");
-      // simple prompt-based picker for now: show folders, let user pick or type
-      const folders = new Set<string>([""]);
+    // inline folder browser
+    let browsing = false;
+    let allRows: any[] = [];
+    const renderFolders = () => {
+      // breadcrumb for the folder being browsed
+      const parts = folder ? folder.slice(0, -1).split("/") : [];
+      crumbs.innerHTML = `<span class="np-fc" data-p="">root</span>` +
+        parts.map((p, i) => ` / <span class="np-fc" data-p="${parts.slice(0,i+1).join("/")}/">${p}</span>`).join("");
+      crumbs.querySelectorAll(".np-fc").forEach(c => {
+        (c as HTMLElement).style.cssText = "cursor:pointer; text-decoration:underline;";
+        c.addEventListener("click", () => { folder = (c as HTMLElement).dataset.p || ""; folderSpan.textContent = folder || "root"; renderFolders(); });
+      });
+      // subfolders of the current folder
+      const subs = new Set<string>();
       for (const r of allRows) {
         if (r.name.endsWith("__autosave")) continue;
-        const parts = r.name.split("/"); parts.pop();  // drop filename
-        let acc = "";
-        for (const p of parts) { acc += p + "/"; folders.add(acc); }
+        if (!r.name.startsWith(folder)) continue;
+        const rest = r.name.slice(folder.length);
+        const slash = rest.indexOf("/");
+        if (slash !== -1) subs.add(rest.slice(0, slash));
       }
-      const picked = prompt("Folder (end with / , blank = root):\nExisting:\n" + [...folders].sort().join("\n"), folder);
-      if (picked !== null) { folder = picked.trim(); if (folder && !folder.endsWith("/")) folder += "/"; folderSpan.textContent = folder || "root"; }
+      folderList.innerHTML = "";
+      if (!subs.size) folderList.innerHTML = `<div class="np-item" style="color:var(--text-secondary-color,#888)">no subfolders here</div>`;
+      for (const s of [...subs].sort()) {
+        const it = document.createElement("div");
+        it.className = "np-item";
+        it.textContent = "📁 " + s;
+        it.addEventListener("click", () => { folder = folder + s + "/"; folderSpan.textContent = folder; renderFolders(); });
+        folderList.appendChild(it);
+      }
+    };
+
+    box.querySelector(".np-d-browse")!.addEventListener("click", async () => {
+      browsing = !browsing;
+      crumbs.style.display = browsing ? "" : "none";
+      folderList.style.display = browsing ? "" : "none";
+      (box.querySelector(".np-d-browse") as HTMLElement).textContent = browsing ? "Done" : "Change folder…";
+      if (browsing && !allRows.length) allRows = await searchNotes("");
+      if (browsing) renderFolders();
     });
   }
 
