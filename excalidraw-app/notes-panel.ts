@@ -498,7 +498,12 @@ export function initNotesPanel() {
           }
           await reload();
         });
-        item.appendChild(label); item.appendChild(ren); item.appendChild(del);
+        const hist = document.createElement("button");
+        hist.textContent = "🕐";
+        hist.title = "version history";
+        hist.style.cssText = "border:none; background:none; cursor:pointer; font-size:13px;";
+        hist.addEventListener("click", (ev) => { ev.stopPropagation(); openHistory(file.full); });
+        item.appendChild(label); item.appendChild(hist); item.appendChild(ren); item.appendChild(del);
         list.appendChild(item);
       }
     };
@@ -646,6 +651,86 @@ export function initNotesPanel() {
     });
     if (currentName) { try { await saveNote(currentName); } catch {} }
     toast(`linked ${ids.length} → ${linkTarget.note}`);
+  }
+
+  function openHistory(noteName: string) {
+    const { box, close } = makeDialog();
+    box.innerHTML = `
+      <h3>History — ${noteName}</h3>
+      <div style="font-size:12px;color:var(--text-secondary-color,#888)">Preview is read-only. "Restore" replaces the current note (and that itself is backed up).</div>
+      <div class="np-dialog-list np-hist-list"></div>
+      <div class="np-dialog-actions"><button class="np-h-close">Close</button></div>`;
+    const list = box.querySelector(".np-hist-list") as HTMLDivElement;
+    box.querySelector(".np-h-close")!.addEventListener("click", close);
+
+    (async () => {
+      const rows = await (await fetch(API_BASE + "/versions.php?name=" + encodeURIComponent(noteName))).json();
+      list.innerHTML = "";
+      if (!rows.length) { list.innerHTML = `<div class="np-item" style="color:var(--text-secondary-color,#888)">no saved versions yet</div>`; return; }
+      for (const row of rows) {
+        const item = document.createElement("div");
+        item.className = "np-item";
+        item.style.cssText = "display:flex;justify-content:space-between;align-items:center;gap:6px;";
+        const when = new Date(row.saved_at).toLocaleString();
+        const lbl = document.createElement("span");
+        lbl.style.flex = "1";
+        lbl.textContent = `${when}  ·  ${(row.size/1024).toFixed(0)} KB`;
+        const prev = document.createElement("button");
+        prev.textContent = "👁 preview"; prev.style.cssText = "border:none;background:none;cursor:pointer;font-size:12px;";
+        prev.addEventListener("click", async () => {
+          const v = await (await fetch(API_BASE + "/versions.php?id=" + row.id)).json();
+          openVersionPopup(noteName, JSON.parse(v.json), row.id);  // read-only popup
+        });
+        const rest = document.createElement("button");
+        rest.textContent = "↺ restore"; rest.style.cssText = "border:none;background:none;cursor:pointer;font-size:12px;color:#e8873a;";
+        rest.addEventListener("click", async () => {
+          if (!confirm(`Restore the version from ${when}? Your current note will be backed up first, then replaced.`)) return;
+          const v = await (await fetch(API_BASE + "/versions.php?id=" + row.id)).json();
+          const scene = JSON.parse(v.json);
+          // save current state as a version first happens automatically in save.php,
+          // but we must save the RESTORED content under the note name to commit it:
+          await fetch(API_BASE + "/save.php", { method:"POST", headers:{"Content-Type":"application/json"},
+            body: JSON.stringify({ name: noteName, json: v.json }) });
+          // now load it live
+          await loadScene(scene);
+          setCurrentName(noteName); lastSavedSig = sceneSignature(); updateFlipButtons();
+          toast("restored ✓"); close();
+        });
+        item.appendChild(lbl); item.appendChild(prev); item.appendChild(rest);
+        list.appendChild(item);
+      }
+    })();
+  }
+
+  function openVersionPopup(noteName: string, scene: any, versionId: number) {
+    ensurePopupStyles();
+    const popup = document.createElement("div");
+    popup.className = "note-popup";
+    popup.innerHTML = `
+      <div class="note-popup-bar">
+        <span class="note-popup-title">preview: ${noteName}</span>
+        <span><button class="note-popup-close" title="Close">✕</button></span>
+      </div>
+      <div class="note-popup-body"></div>`;
+    document.body.appendChild(popup);
+    const body = popup.querySelector(".note-popup-body") as HTMLElement;
+    const root = createRoot(body);
+    root.render(React.createElement(ExcalidrawAPIProvider, null,
+      React.createElement(PopupCanvas, { scene, targetIds: [] })));
+    popup.querySelector(".note-popup-close")!.addEventListener("click", () => { root.unmount(); popup.remove(); });
+    // drag (reuse the same bar-drag pattern)
+    const bar = popup.querySelector(".note-popup-bar") as HTMLElement;
+    bar.addEventListener("pointerdown", (e) => {
+      if ((e.target as HTMLElement).closest("button")) return;
+      e.preventDefault();
+      const sx = e.clientX, sy = e.clientY; const rect = popup.getBoundingClientRect();
+      const shield = document.createElement("div");
+      shield.style.cssText = "position:fixed; inset:0; z-index:9999; cursor:move;";
+      document.body.appendChild(shield);
+      const mv = (ev: PointerEvent) => { popup.style.left = rect.left+(ev.clientX-sx)+"px"; popup.style.top = rect.top+(ev.clientY-sy)+"px"; };
+      const up = () => { shield.removeEventListener("pointermove",mv); shield.removeEventListener("pointerup",up); shield.remove(); };
+      shield.addEventListener("pointermove",mv); shield.addEventListener("pointerup",up); shield.setPointerCapture(e.pointerId);
+    });
   }
 
   // wire rail
