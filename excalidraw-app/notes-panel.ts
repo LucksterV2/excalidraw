@@ -668,6 +668,162 @@ export function initNotesPanel() {
     toast(`linked ${ids.length} → ${linkTarget.note}`);
   }
 
+  // ===== Marking menu (stage 1: hardcoded tree, N-aware) =====
+type MenuNode =
+  | { label: string; action: () => void }            // leaf
+  | { label: string; children: (MenuNode|null)[] };    // folder (array length = N directions)
+
+const MENU_N = 8;  // directions per level (stage-1 default; configurable in stage 3)
+
+// hardcoded test tree — 8 slots at top level
+function buildTestMenu(): (MenuNode|null)[] {
+  const api = () => (window as any).notesAPI;
+  const setColor = (c: string) => () => api().updateScene({ appState: { ...api().getAppState(), currentItemStrokeColor: c } });
+  const setZoom = (z: number) => () => {
+    const st = api().getAppState();
+    api().updateScene({ appState: { ...st, zoom: { value: z } } });
+  };
+  return [
+    { label: "Undo", action: () => document.execCommand?.("undo") || api().undo?.() },  // may need real undo hook
+    { label: "Colors", children: [
+      { label: "white", action: setColor("#ffffff") },
+      { label: "red",   action: setColor("#e03131") },
+      { label: "blue",  action: setColor("#1971c2") },
+      { label: "green", action: setColor("#2f9e44") },
+      { label: "yellow",action: setColor("#f08c00") },
+      { label: "pink",  action: setColor("#e64980") },
+      { label: "cyan",  action: setColor("#0c8599") },
+      { label: "gray",  action: setColor("#868e96") },
+    ]},
+    { label: "Zoom 100%", action: setZoom(1) },
+    { label: "Zoom 200%", action: setZoom(2) },
+    { label: "Mode", action: () => { const d = docAtViewCenter(); if (d) { const nx = d.mode==="full"?"page":d.mode==="page"?"scroll":"full"; setMode(d, nx as any); } } },
+    null,  // empty slot
+    null,
+    { label: "Save", action: () => (document.getElementById("np-save") as HTMLElement)?.click() },
+  ];
+}
+
+  // menu input: finger double-tap opens AND selects (finger stays down → drag to select → lift to fire)
+  let lastFingerTap = 0, lastFingerX = 0, lastFingerY = 0;
+  const activeTouches = new Set<number>();
+  let menuPointerId = -1;   // the finger controlling the open menu
+
+  document.addEventListener("pointerdown", (e) => {
+    if (e.pointerType !== "touch") return;
+    activeTouches.add(e.pointerId);
+    if (activeTouches.size > 1) { lastFingerTap = 0; return; }
+    const now = performance.now();
+    if (now - lastFingerTap < 300 && Math.hypot(e.clientX-lastFingerX, e.clientY-lastFingerY) < 50) {
+      e.preventDefault(); e.stopPropagation();
+      openMenu(e.clientX, e.clientY);
+      menuPointerId = e.pointerId;          // this finger now drives selection
+      lastFingerTap = 0;
+    } else {
+      lastFingerTap = now; lastFingerX = e.clientX; lastFingerY = e.clientY;
+    }
+  }, true);
+
+  document.addEventListener("pointermove", (e) => {
+    if (menuOpen && e.pointerType === "touch" && e.pointerId === menuPointerId) {
+      e.preventDefault(); e.stopPropagation();
+      menuPenMove(e.clientX, e.clientY);     // same selection logic, finger-driven
+    }
+  }, true);
+
+  document.addEventListener("pointerup", (e) => {
+    if (e.pointerType === "touch") activeTouches.delete(e.pointerId);
+    if (menuOpen && e.pointerType === "touch" && e.pointerId === menuPointerId) {
+      e.preventDefault(); e.stopPropagation();
+      menuPenUp();                           // same commit logic
+      menuPointerId = -1;
+    }
+  }, true);
+  document.addEventListener("pointercancel", (e) => { if (e.pointerType === "touch") activeTouches.delete(e.pointerId); }, true);
+
+let menuEl: HTMLDivElement | null = null;
+let menuOpen = false;
+let menuAnchor = { x: 0, y: 0 };            // screen px — current level's center
+let menuStack: (MenuNode|null)[][] = [];    // levels; top is current
+let menuHighlight = -1;
+
+const MENU_RADIUS = 90;      // px from center to slot
+const MENU_PICK_DIST = 45;   // px pen must travel to commit a direction
+
+function openMenu(x: number, y: number) {
+  menuOpen = true;
+  menuAnchor = { x, y };
+  menuStack = [buildTestMenu()];
+  menuHighlight = -1;
+  renderMenu();
+}
+function closeMenu() {
+  menuOpen = false;
+  menuStack = [];
+  menuHighlight = -1;
+  if (menuEl) { menuEl.remove(); menuEl = null; }
+}
+
+function renderMenu() {
+  if (!menuEl) {
+    menuEl = document.createElement("div");
+    menuEl.style.cssText = "position:fixed; inset:0; z-index:500; pointer-events:none;";
+    document.body.appendChild(menuEl);
+  }
+  const level = menuStack[menuStack.length - 1];
+  const cx = menuAnchor.x, cy = menuAnchor.y;
+  let html = `<div style="position:absolute; left:${cx}px; top:${cy}px; width:8px; height:8px; margin:-4px; border-radius:50%; background:#e8873a;"></div>`;
+  for (let i = 0; i < MENU_N; i++) {
+    const node = level[i];
+    const ang = (i / MENU_N) * Math.PI * 2 - Math.PI/2;  // slot 0 = up
+    const sx = cx + Math.cos(ang) * MENU_RADIUS;
+    const sy = cy + Math.sin(ang) * MENU_RADIUS;
+    const isFolder = node && "children" in node;
+    const hl = i === menuHighlight;
+    const label = node ? node.label : "";
+    html += `<div style="position:absolute; left:${sx}px; top:${sy}px; transform:translate(-50%,-50%);
+      padding:4px 8px; border-radius:8px; font:12px sans-serif; white-space:nowrap;
+      background:${hl?'#e8873a':'rgba(30,30,30,.92)'}; color:${hl?'#000':node?'#eee':'#555'};
+      border:1px solid ${hl?'#e8873a':'#444'}; ${isFolder?'font-weight:bold;':''}">${label || '·'}${isFolder?' ▸':''}</div>`;
+  }
+  menuEl.innerHTML = html;
+}
+
+function menuPenMove(x: number, y: number) {
+  if (!menuOpen) return;
+  const dx = x - menuAnchor.x, dy = y - menuAnchor.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist < MENU_PICK_DIST) { menuHighlight = -1; renderMenu(); return; }
+
+  let ang = Math.atan2(dy, dx) + Math.PI/2;
+  ang = (ang + Math.PI*2) % (Math.PI*2);
+  const slot = Math.round(ang / (Math.PI*2) * MENU_N) % MENU_N;
+  const level = menuStack[menuStack.length - 1];
+  const node = level[slot];
+
+  if (node && "children" in node) {
+    // FOLDER: descend immediately (continuous — no lift needed)
+    const sang = (slot / MENU_N) * Math.PI*2 - Math.PI/2;
+    menuAnchor = { x: menuAnchor.x + Math.cos(sang)*MENU_RADIUS, y: menuAnchor.y + Math.sin(sang)*MENU_RADIUS };
+    menuStack.push(node.children);
+    menuHighlight = -1;
+    renderMenu();
+  } else {
+    // leaf or empty: just highlight; commit happens on lift
+    if (slot !== menuHighlight) { menuHighlight = slot; renderMenu(); }
+  }
+}
+
+function menuPenUp() {
+  if (!menuOpen) return;
+  const level = menuStack[menuStack.length - 1];
+  const node = menuHighlight >= 0 ? level[menuHighlight] : null;
+  if (node && !("children" in node)) {
+    try { node.action(); } catch (e) { console.error(e); }
+  }
+  closeMenu();
+}
+
   function openHistory(noteName: string) {
     const { box, close } = makeDialog();
     box.innerHTML = `
@@ -2097,4 +2253,48 @@ async function placeImage(hash: string, dataURL: string, mime: string) {
       customData: { imgHash: hash, imgMime: mime } } as any,
   ]);
   api.updateScene({ elements: [...api.getSceneElements(), ...els] });
+}
+
+// ===== Marking menu (stage 1: hardcoded tree, N-aware) =====
+type MenuNode =
+  | { label: string; action: () => void }            // leaf
+  | { label: string; children: (MenuNode|null)[] };    // folder (array length = N directions)
+
+const MENU_N = 8;  // directions per level (stage-1 default; configurable in stage 3)
+
+// hardcoded test tree — 8 slots at top level
+function buildTestMenu(): (MenuNode|null)[] {
+  const api = () => (window as any).notesAPI;
+  const setColor = (c: string) => () => api().updateScene({ appState: { ...api().getAppState(), currentItemStrokeColor: c } });
+  const setZoom = (z: number) => () => {
+    const st = api().getAppState();
+    api().updateScene({ appState: { ...st, zoom: { value: z } } });
+  };
+  return [
+    { label: "Undo", action: () => {
+      document.querySelector(".excalidraw")?.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "z", code: "KeyZ", ctrlKey: true, bubbles: true })
+      );
+    }},
+    { label: "Colors", children: [
+      { label: "white", action: setColor("#ffffff") },
+      { label: "red",   action: setColor("#e03131") },
+      { label: "blue",  action: setColor("#1971c2") },
+      { label: "green", action: setColor("#2f9e44") },
+      { label: "yellow",action: setColor("#f08c00") },
+      { label: "pink",  action: setColor("#e64980") },
+      { label: "cyan",  action: setColor("#0c8599") },
+      { label: "gray",  action: setColor("#868e96") },
+    ]},
+    { label: "Zoom 100%", action: setZoom(1) },
+    { label: "Zoom 200%", action: setZoom(2) },
+    { label: "Mode", action: () => { const d = docAtViewCenter(); if (d) { const nx = d.mode==="full"?"page":d.mode==="page"?"scroll":"full"; setMode(d, nx as any); } } },
+    null,  // empty slot
+    { label: "Save", action: () => (document.getElementById("np-save") as HTMLElement)?.click() },
+    { label: "Redo", action: () => {
+      document.querySelector(".excalidraw")?.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "z", code: "KeyZ", ctrlKey: true, shiftKey: true, bubbles: true })
+      );
+    }},
+  ];
 }
