@@ -668,7 +668,7 @@ export function initNotesPanel() {
     toast(`linked ${ids.length} → ${linkTarget.note}`);
   }
 
-  // ===== Marking menu (stage 1: hardcoded tree, N-aware) =====
+// ===== Marking menu (stage 1: hardcoded tree, N-aware) =====
 type MenuNode =
   | { label: string; action: () => void }            // leaf
   | { label: string; children: (MenuNode|null)[] };    // folder (array length = N directions)
@@ -684,7 +684,11 @@ function buildTestMenu(): (MenuNode|null)[] {
     api().updateScene({ appState: { ...st, zoom: { value: z } } });
   };
   return [
-    { label: "Undo", action: () => document.execCommand?.("undo") || api().undo?.() },  // may need real undo hook
+    { label: "undo", action: () => {
+      document.querySelector(".excalidraw")?.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "z", code: "KeyZ", ctrlKey: true, bubbles: true })
+      );
+    }},
     { label: "Colors", children: [
       { label: "white", action: setColor("#ffffff") },
       { label: "red",   action: setColor("#e03131") },
@@ -699,10 +703,15 @@ function buildTestMenu(): (MenuNode|null)[] {
     { label: "Zoom 200%", action: setZoom(2) },
     { label: "Mode", action: () => { const d = docAtViewCenter(); if (d) { const nx = d.mode==="full"?"page":d.mode==="page"?"scroll":"full"; setMode(d, nx as any); } } },
     null,  // empty slot
-    null,
     { label: "Save", action: () => (document.getElementById("np-save") as HTMLElement)?.click() },
+    { label: "Redo", action: () => {
+      document.querySelector(".excalidraw")?.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "z", code: "KeyZ", ctrlKey: true, shiftKey: true, bubbles: true })
+      );
+    }},
   ];
 }
+
 
   // menu input: finger double-tap opens AND selects (finger stays down → drag to select → lift to fire)
   let lastFingerTap = 0, lastFingerX = 0, lastFingerY = 0;
@@ -2255,46 +2264,3 @@ async function placeImage(hash: string, dataURL: string, mime: string) {
   api.updateScene({ elements: [...api.getSceneElements(), ...els] });
 }
 
-// ===== Marking menu (stage 1: hardcoded tree, N-aware) =====
-type MenuNode =
-  | { label: string; action: () => void }            // leaf
-  | { label: string; children: (MenuNode|null)[] };    // folder (array length = N directions)
-
-const MENU_N = 8;  // directions per level (stage-1 default; configurable in stage 3)
-
-// hardcoded test tree — 8 slots at top level
-function buildTestMenu(): (MenuNode|null)[] {
-  const api = () => (window as any).notesAPI;
-  const setColor = (c: string) => () => api().updateScene({ appState: { ...api().getAppState(), currentItemStrokeColor: c } });
-  const setZoom = (z: number) => () => {
-    const st = api().getAppState();
-    api().updateScene({ appState: { ...st, zoom: { value: z } } });
-  };
-  return [
-    { label: "Undo", action: () => {
-      document.querySelector(".excalidraw")?.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "z", code: "KeyZ", ctrlKey: true, bubbles: true })
-      );
-    }},
-    { label: "Colors", children: [
-      { label: "white", action: setColor("#ffffff") },
-      { label: "red",   action: setColor("#e03131") },
-      { label: "blue",  action: setColor("#1971c2") },
-      { label: "green", action: setColor("#2f9e44") },
-      { label: "yellow",action: setColor("#f08c00") },
-      { label: "pink",  action: setColor("#e64980") },
-      { label: "cyan",  action: setColor("#0c8599") },
-      { label: "gray",  action: setColor("#868e96") },
-    ]},
-    { label: "Zoom 100%", action: setZoom(1) },
-    { label: "Zoom 200%", action: setZoom(2) },
-    { label: "Mode", action: () => { const d = docAtViewCenter(); if (d) { const nx = d.mode==="full"?"page":d.mode==="page"?"scroll":"full"; setMode(d, nx as any); } } },
-    null,  // empty slot
-    { label: "Save", action: () => (document.getElementById("np-save") as HTMLElement)?.click() },
-    { label: "Redo", action: () => {
-      document.querySelector(".excalidraw")?.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "z", code: "KeyZ", ctrlKey: true, shiftKey: true, bubbles: true })
-      );
-    }},
-  ];
-}
