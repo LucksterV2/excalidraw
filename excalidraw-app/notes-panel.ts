@@ -73,13 +73,19 @@ async function saveNote(name: string) {
     }).catch(()=>{});
   }
 
-  const res = await fetch(API_BASE + "/save.php", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, json: JSON.stringify(scene) }),
-  });
-  return res.json();
+  saveInFlight = true;
+  try {
+    const res = await fetch(API_BASE + "/save.php", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, json: JSON.stringify(scene) }),
+    });
+    return res.json();
+  } finally {
+    saveInFlight = false;
+  }
 }
+
 
 async function ensurePdfUploaded(doc: PdfDoc): Promise<string> {
   const res = await fetch(API_BASE + "/docsave.php", {
@@ -92,53 +98,58 @@ async function ensurePdfUploaded(doc: PdfDoc): Promise<string> {
 
 // Load a scene object (from any source) onto the canvas.
 async function loadScene(scene: any) {
-  const api = (window as any).notesAPI;
-  strokeStash = [];
-  teardownAllDocs();
+  if (loadLock) return;
+  loadLock = true;
+  try {
+    const api = (window as any).notesAPI;
+    strokeStash = [];
+    teardownAllDocs();
 
-  const pdfList = scene.pdfs || (scene.pdf ? [{ ...scene.pdf, id: null }] : []);
-  for (const sp of pdfList) {
-    await mountPdfFromHash(sp.hash);
-    const doc = pdfDocs[pdfDocs.length - 1];
-    if (!doc) continue;
-    if (sp.id) doc.id = sp.id;
-    doc.origin = sp.origin;
-    doc.mode = sp.mode;
-    doc.currentPage = sp.currentPage;
-    doc.scrollWindow = sp.scrollWindow || undefined;
-    doc.scrollOffset = sp.scrollOffset || 0;
-    const byIndex = new Map(sp.pages.map((p: any) => [p.index, p]));
-    for (const p of doc.pages) {
-      const s: any = byIndex.get(p.index);
-      if (s) { p.padTop = s.padTop; p.padBottom = s.padBottom; p.padLeft = s.padLeft; p.padRight = s.padRight; }
+    const pdfList = scene.pdfs || (scene.pdf ? [{ ...scene.pdf, id: null }] : []);
+    for (const sp of pdfList) {
+      await mountPdfFromHash(sp.hash);
+      const doc = pdfDocs[pdfDocs.length - 1];
+      if (!doc) continue;
+      if (sp.id) doc.id = sp.id;
+      doc.origin = sp.origin;
+      doc.mode = sp.mode;
+      doc.currentPage = sp.currentPage;
+      doc.scrollWindow = sp.scrollWindow || undefined;
+      doc.scrollOffset = sp.scrollOffset || 0;
+      const byIndex = new Map(sp.pages.map((p: any) => [p.index, p]));
+      for (const p of doc.pages) {
+        const s: any = byIndex.get(p.index);
+        if (s) { p.padTop = s.padTop; p.padBottom = s.padBottom; p.padLeft = s.padLeft; p.padRight = s.padRight; }
+      }
+      layoutPages(doc);
+      computeBox(doc);
+      await doc.rerender();
     }
-    layoutPages(doc);
-    computeBox(doc);
-    await doc.rerender();
+    syncBox();
+
+    api.updateScene({
+      elements: scene.elements,
+      appState: { ...api.getAppState(), ...scene.appState },
+    });
+
+    const imgEls = scene.elements.filter((e: any) => e.type === "image" && e.customData?.imgHash);
+    for (const el of imgEls) {
+      try {
+        const r = await fetch(API_BASE + "/imgload.php?hash=" + el.customData.imgHash);
+        if (!r.ok) continue;
+        const blob = await r.blob();
+        const dataURL = await new Promise<string>((res) => {
+          const fr = new FileReader(); fr.onload = () => res(fr.result as string); fr.readAsDataURL(blob);
+        });
+        api.addFiles([{ id: el.fileId, dataURL, mimeType: el.customData.imgMime || "image/png", created: Date.now() }]);
+      } catch {}
+    }
+    api.updateScene({ elements: api.getSceneElements() });
+
+    refreshInk();
+  } finally {
+    loadLock = false;
   }
-  syncBox();
-
-  api.updateScene({
-    elements: scene.elements,
-    appState: { ...api.getAppState(), ...scene.appState },
-  });
-
-  // restore image files from their hashes
-  const imgEls = scene.elements.filter((e: any) => e.type === "image" && e.customData?.imgHash);
-  for (const el of imgEls) {
-    try {
-      const r = await fetch(API_BASE + "/imgload.php?hash=" + el.customData.imgHash);
-      if (!r.ok) continue;
-      const blob = await r.blob();
-      const dataURL = await new Promise<string>((res) => {
-        const fr = new FileReader(); fr.onload = () => res(fr.result as string); fr.readAsDataURL(blob);
-      });
-      api.addFiles([{ id: el.fileId, dataURL, mimeType: el.customData.imgMime || "image/png", created: Date.now() }]);
-    } catch {}
-  }
-  api.updateScene({ elements: api.getSceneElements() });
-
-  refreshInk();
 }
 
 // Fetch a named note and load it; then check for a newer autosave.
@@ -328,7 +339,7 @@ export function initNotesPanel() {
     return JSON.stringify(a.getSceneElements().map((e: any) => [e.id, e.x, e.y, e.version]));
   }
   async function doAutosave() {
-    if (!currentName) return;
+    if (!currentName || loadLock || saveInFlight) return;
     const sig = sceneSignature();
     if (sig === lastSavedSig) return;
     try { await saveNote(currentName + "__autosave"); lastSavedSig = sig; } catch {}
@@ -364,6 +375,7 @@ export function initNotesPanel() {
     const doIt = async () => {
       const typed = input.value.trim();
       if (!typed) return;
+      if (loadLock || saveInFlight) { toast("busy — wait a moment"); return; }
       const full = folder + typed;
       try { await saveNote(full); setCurrentName(full); lastSavedSig = sceneSignature(); toast("saved ✓"); close(); }
       catch { toast("save failed"); }
@@ -469,6 +481,7 @@ export function initNotesPanel() {
         label.textContent = "📄 " + file.label;
         label.style.cssText = "flex:1; cursor:pointer;";
         label.addEventListener("click", async () => {
+          if (loadLock || saveInFlight) { toast("busy — wait a moment"); return; }
           try { await loadNote(file.full); setCurrentName(file.full); lastSavedSig = sceneSignature(); toast("loaded ✓"); updateFlipButtons(); close(); }
           catch { toast("load failed"); }
         });
@@ -525,6 +538,7 @@ export function initNotesPanel() {
           item.className = "np-item"; item.textContent = "📄 " + row.name;
           item.style.cursor = "pointer";
           item.addEventListener("click", async () => {
+            if (loadLock || saveInFlight) { toast("busy — wait a moment"); return; }
             try { await loadNote(row.name); setCurrentName(row.name); lastSavedSig = sceneSignature(); toast("loaded ✓"); updateFlipButtons(); close(); }
             catch { toast("load failed"); }
           });
@@ -621,13 +635,14 @@ export function initNotesPanel() {
 
   async function openTagResult(row: any, jump: boolean) {
     if (jump) {
+      if (loadLock || saveInFlight) { toast("busy — wait a moment"); return; }
       await loadNote(row.note);
       setCurrentName(row.note); lastSavedSig = sceneSignature(); updateFlipButtons();
       const api = (window as any).notesAPI;
       const el = api.getSceneElements().find((e: any) => e.id === row.elementId);
       if (el) api.setViewport({ target: [el], fit: "scale-down", animation: true });
     } else {
-      (window as any).openNotePopup(row.note, [row.elementId]);   // popup framed on the tagged element
+      (window as any).openNotePopup(row.note, [row.elementId]);
     }
   }
 
@@ -684,14 +699,12 @@ export function initNotesPanel() {
         const rest = document.createElement("button");
         rest.textContent = "↺ restore"; rest.style.cssText = "border:none;background:none;cursor:pointer;font-size:12px;color:#e8873a;";
         rest.addEventListener("click", async () => {
+          if (loadLock || saveInFlight) { toast("busy — wait a moment"); return; }
           if (!confirm(`Restore the version from ${when}? Your current note will be backed up first, then replaced.`)) return;
           const v = await (await fetch(API_BASE + "/versions.php?id=" + row.id)).json();
           const scene = JSON.parse(v.json);
-          // save current state as a version first happens automatically in save.php,
-          // but we must save the RESTORED content under the note name to commit it:
           await fetch(API_BASE + "/save.php", { method:"POST", headers:{"Content-Type":"application/json"},
             body: JSON.stringify({ name: noteName, json: v.json }) });
-          // now load it live
           await loadScene(scene);
           setCurrentName(noteName); lastSavedSig = sceneSignature(); updateFlipButtons();
           toast("restored ✓"); close();
@@ -1165,12 +1178,13 @@ export async function openNotePopup(noteName: string, targetIds: string[] = []) 
   popup.querySelector(".note-popup-close")!.addEventListener("click", () => { root.unmount(); popup.remove(); });
 
   popup.querySelector(".note-popup-max")!.addEventListener("click", async () => {
+    if (loadLock || saveInFlight) { (window as any).notesAPI?.setToast?.({message:"busy — wait a moment", duration:2000}); return; }
     root.unmount(); popup.remove();
     await loadNote(noteName);
-    (window as any).__setCurrentName?.(noteName);   // ← sync currentName to the loaded note
+    (window as any).__setCurrentName?.(noteName);
     const api = (window as any).notesAPI;
     const targets = api.getSceneElements().filter((el: any) => targetIds.includes(el.id));
-        if (targets.length) api.setViewport({ target: targets, fit: "scale-down", animation: false });
+    if (targets.length) api.setViewport({ target: targets, fit: "scale-down", animation: false });
   });
 
   const bar = popup.querySelector(".note-popup-bar") as HTMLElement;
@@ -1235,6 +1249,8 @@ type PdfDoc = {
 };
 
 let pdfDocs: PdfDoc[] = [];
+let loadLock = false;      // true while a load/restore is in progress
+let saveInFlight = false;  // true while a save's HTTP request is pending
 
 // doc whose box/bounds contain a world point (with sectoring early-out)
 function docAtPoint(wx: number, wy: number): PdfDoc | null {
