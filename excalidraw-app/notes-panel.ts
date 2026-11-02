@@ -252,7 +252,7 @@ type MenuSlot = {
   color?: string;
   zoom?: number;
   // slider:
-  prop?: "opacity" | "strokeWidth" | "zoom" | "custom";
+  prop?: "opacity" | "strokeWidth" | "zoom" | "custom" | "roughness" | "fontSize";
   min?: number;
   max?: number;
   sdefault?: number | null;   // captured standard value (Stage B)
@@ -261,7 +261,8 @@ type MenuConfig = { dirs: number; children: MenuSlot[] };   // top level
 
 type MenuNode =
   | { label: string; action: () => void }
-  | { label: string; children: (MenuNode|null)[] };
+  | { label: string; children: (MenuNode|null)[]; dirs?: number }
+  | { label: string; slider: { prop: string; min: number; max: number } };
 
 const COMMANDS: Record<string, { label: string; run: () => void }> = {
   undo:   { label: "Undo",   run: () => dispatchKey("z", { ctrlKey: true }) },
@@ -346,11 +347,11 @@ const DEFAULT_MENU: MenuConfig = {
 
 function resolveSlot(slot: MenuSlot | null): MenuNode | null {
   if (!slot || slot.type === "empty") return null;
-  if (slot.type === "folder") {
+    if (slot.type === "folder") {
     const n = slot.dirs || 8;
     const kids = (slot.children || []).slice(0, n);
     while (kids.length < n) kids.push({ type: "empty" });
-    return { label: slot.label || "…", children: kids.map(resolveSlot) };
+    return { label: slot.label || "…", children: kids.map(resolveSlot), dirs: n } as any;
   }
   if (slot.type === "command") {
     const c = COMMANDS[slot.command || ""];
@@ -359,7 +360,13 @@ function resolveSlot(slot: MenuSlot | null): MenuNode | null {
   if (slot.type === "color") return { label: slot.label || slot.color || "color", action: () => setColorCmd(slot.color!) };
   if (slot.type === "zoom")  return { label: slot.label || ((slot.zoom!*100)+"%"), action: () => setZoomCentered(slot.zoom!) };
     if (slot.type === "slider") {
-    return { label: slot.label || slot.prop || "slider", slider: { prop: slot.prop||"opacity", min: slot.min??0, max: slot.max??100 } } as any;
+    const prop = slot.prop || "opacity";
+    const min = slot.min ?? 0, max = slot.max ?? 100;
+    const myDefault = slot.sdefault;
+    return {
+      label: slot.label || prop,
+      sliderFolder: { prop, min, max, myDefault },
+    } as any;
   }
   return null;
 }
@@ -373,23 +380,23 @@ function currentMenuLevel(): (MenuNode|null)[] {
 
 function applySliderValue(prop: string, v: number) {
   const api = (window as any).notesAPI;
-  if (prop === "opacity") {
-    api.updateScene({ appState: { ...api.getAppState(), currentItemOpacity: Math.round(v) } });
-  }
+  const st = api.getAppState();
+  if (prop === "opacity") api.updateScene({ appState: { ...st, currentItemOpacity: Math.round(v) } });
   else if (prop === "strokeWidth") {
-    api.setActiveTool({ type: "freedraw" });
-    const steps = [1, 2, 4];
-    const snapped = steps[Math.max(0, Math.min(2, Math.round(v)))];
-    requestAnimationFrame(() => {
-      api.updateScene({ appState: { ...api.getAppState(), currentItemStrokeWidth: snapped } });
-    });
+    const keys = ["thin","medium","bold"];
+    api.updateScene({ appState: { ...st, currentItemStrokeWidthKey: keys[Math.max(0,Math.min(2,Math.round(v)))] } });
   }
+  else if (prop === "roughness") api.updateScene({ appState: { ...st, currentItemRoughness: Math.round(v) } });
+  else if (prop === "fontSize") api.updateScene({ appState: { ...st, currentItemFontSize: Math.round(v) } });
   else if (prop === "zoom") setZoomCentered(v);
 }
+
 function readSliderValue(prop: string): number {
   const st = (window as any).notesAPI.getAppState();
   if (prop === "opacity") return st.currentItemOpacity ?? 100;
-  if (prop === "strokeWidth") return st.currentItemStrokeWidth ?? 1;
+  if (prop === "strokeWidth") return ({thin:0,medium:1,bold:2} as any)[st.currentItemStrokeWidthKey] ?? 0;
+  if (prop === "roughness") return st.currentItemRoughness ?? 1;
+  if (prop === "fontSize") return st.currentItemFontSize ?? 20;
   if (prop === "zoom") return st.zoom.value;
   return 0;
 }
@@ -413,6 +420,9 @@ export function initNotesPanel() {
   `;
   document.body.appendChild(panel);
 
+  panel.classList.add("np-collapsed");
+  (panel.querySelector("#np-toggle") as HTMLElement).textContent = "‹";
+
   const style = document.createElement("style");
   style.textContent = `
     #notes-panel {
@@ -431,7 +441,7 @@ export function initNotesPanel() {
       border: 1px solid transparent; border-radius: 8px;
     }
     #notes-panel button:hover { background: var(--button-hover-bg, #ececf0); }
-    #notes-panel.np-collapsed button:not(#np-toggle) { display: none; }
+    #notes-panel.np-collapsed button:not(#np-toggle):not(#np-settings) { display: none; }
 
     /* shared popup dialog */
     .np-dialog-backdrop {
@@ -521,164 +531,209 @@ export function initNotesPanel() {
   const api = () => (window as any).notesAPI;
   const selectedIds = () => Object.keys(api().getAppState().selectedElementIds || {});
 
-  // ===== Config editor (ring layout) =====
-  function openMenuEditor() {
-    const { box, close } = makeDialog();
-    box.style.width = "420px";
-    // work on a deep copy; commit on Save
-    let working: MenuConfig = JSON.parse(JSON.stringify((window as any).__getMenuConfig()));
-    let path: number[] = [];   // indices into folders we've descended into
+function openMenuEditor() {
+  const { box, close } = makeDialog();
+  box.style.width = "480px";
+  box.style.background = "#1b1b1b";   // dark, like the menu
+  box.style.color = "#eee";
+  let working: MenuConfig = JSON.parse(JSON.stringify((window as any).__getMenuConfig()));
+  let path: number[] = [];
+  let editing = -1;   // which slot's popover is open (-1 = none)
 
-    // get the level (children array + its dirs) at the current path
-    const levelAt = (): { arr: MenuSlot[]; dirs: number; setDirs: (n:number)=>void } => {
-      if (path.length === 0) {
-        return { arr: working.children, dirs: working.dirs, setDirs: (n)=>{ working.dirs = n; } };
-      }
-      let slot: any = working;
-      let container = working.children;
-      let dirsOwner: any = working;
-      for (const idx of path) {
-        slot = container[idx];
-        if (!slot.children) slot.children = [];
-        container = slot.children;
-        dirsOwner = slot;
-      }
-      return {
-        arr: container,
-        dirs: dirsOwner.dirs || 8,
-        setDirs: (n)=>{ dirsOwner.dirs = n; },
-      };
-    };
+  const levelAt = () => {
+    if (path.length === 0) return { arr: working.children, dirs: working.dirs, setDirs: (n:number)=>{ working.dirs = n; } };
+    let container = working.children, dirsOwner: any = working;
+    for (const idx of path) { const s = container[idx]; if (!s.children) s.children = []; container = s.children; dirsOwner = s; }
+    return { arr: container, dirs: dirsOwner.dirs || 8, setDirs: (n:number)=>{ dirsOwner.dirs = n; } };
+  };
+  const ensureLen = (arr: MenuSlot[], n: number) => { while (arr.length < n) arr.push({ type:"empty" }); arr.length = Math.max(arr.length, n); };
+  const slotLabel = (s: MenuSlot) => s.type==="empty" ? "" :
+    s.label || (s.type==="command" ? (COMMANDS[s.command||""]?.label||s.command) :
+                s.type==="color" ? "" : s.type==="zoom" ? ((s.zoom||1)*100+"%") :
+                s.type==="folder" ? "folder" : s.type==="slider" ? (s.prop||"slider") : "");
 
-    const ensureLen = (arr: MenuSlot[], n: number) => { while (arr.length < n) arr.push({ type: "empty" }); arr.length = Math.max(arr.length, n); };
-
-    const render = () => {
-      const { arr, dirs, setDirs } = levelAt();
-      ensureLen(arr, dirs);
-      box.innerHTML = `
-        <h3>Edit menu</h3>
-        <div class="np-ed-crumbs" style="font-size:12px;color:var(--text-secondary-color,#888);"></div>
-        <div style="display:flex;align-items:center;gap:8px;font-size:12px;">
-          Directions: <input class="np-ed-dirs" type="number" min="1" max="10" value="${dirs}" style="width:52px;">
+  const render = () => {
+    const { arr, dirs, setDirs } = levelAt();
+    ensureLen(arr, dirs);
+    box.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+        <h3 style="margin:0;color:#eee;">Edit menu</h3>
+        <div style="font-size:12px;color:#999;display:flex;align-items:center;gap:6px;">
+          Dirs
+          <button class="np-ed-minus" style="width:24px;height:24px;background:#2a2a2a;color:#eee;border:1px solid #444;border-radius:6px;cursor:pointer;font-size:14px;line-height:1;">−</button>
+          <span class="np-ed-dirsval" style="min-width:18px;text-align:center;">${dirs}</span>
+          <button class="np-ed-plus" style="width:24px;height:24px;background:#2a2a2a;color:#eee;border:1px solid #444;border-radius:6px;cursor:pointer;font-size:14px;line-height:1;">+</button>
         </div>
-        <div class="np-ed-ring" style="position:relative;width:360px;height:360px;margin:6px auto;"></div>
-        <div class="np-ed-edit"></div>
-        <div class="np-dialog-actions">
-          <button class="np-ed-cancel">Cancel</button>
-          <button class="np-ed-save">Save</button>
-        </div>`;
-      // breadcrumb
-      const crumbs = box.querySelector(".np-ed-crumbs") as HTMLElement;
-      crumbs.innerHTML = `<span class="np-ec" data-d="0" style="cursor:pointer;text-decoration:underline;">root</span>` +
-        path.map((idx,i) => {
-          // label of the folder at this depth
-          let c = working.children, s: any;
-          for (let k=0;k<=i;k++){ s = c[path[k]]; c = s.children||[]; }
-          return ` / <span class="np-ec" data-d="${i+1}" style="cursor:pointer;text-decoration:underline;">${s?.label||"folder"}</span>`;
-        }).join("");
-      crumbs.querySelectorAll(".np-ec").forEach(c => c.addEventListener("click", () => {
-        path = path.slice(0, +(c as HTMLElement).dataset.d!); render();
-      }));
-      // dirs input
-      (box.querySelector(".np-ed-dirs") as HTMLInputElement).addEventListener("change", (e) => {
-        let n = Math.max(1, Math.min(10, +(e.target as HTMLInputElement).value || 8));
-        setDirs(n); ensureLen(arr, n); render();
-      });
-      // ring of slots
-      const ring = box.querySelector(".np-ed-ring") as HTMLElement;
-      const R = 140, cx = 180, cy = 180;
-      for (let i=0;i<dirs;i++){
-        const slot = arr[i] || { type:"empty" };
-        const ang = (i/dirs)*Math.PI*2 - Math.PI/2;
-        const x = cx + Math.cos(ang)*R, y = cy + Math.sin(ang)*R;
-        const d = document.createElement("div");
-        const lbl = slotLabel(slot);
-        const col = slot.type==="color" ? slot.color : "";
-        d.style.cssText = `position:absolute;left:${x}px;top:${y}px;transform:translate(-50%,-50%);
-          min-width:54px;max-width:80px;text-align:center;padding:6px 8px;border-radius:8px;cursor:pointer;
-          font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-          background:${col||'rgba(120,120,120,.15)'};border:1px solid var(--default-border-color,#888);
-          ${slot.type==="folder"?'font-weight:bold;':''}`;
-        d.textContent = lbl + (slot.type==="folder"?" ▸":"");
-        d.addEventListener("click", () => editSlot(i));
-        ring.appendChild(d);
-      }
-      // center dot
-      const dot = document.createElement("div");
-      dot.style.cssText = `position:absolute;left:${cx}px;top:${cy}px;transform:translate(-50%,-50%);width:10px;height:10px;border-radius:50%;background:#e8873a;`;
-      ring.appendChild(dot);
+      </div>
+      <div class="np-ed-crumbs" style="font-size:12px;color:#999;margin-bottom:6px;"></div>
+              <div class="np-ed-ring" style="position:relative;width:440px;height:400px;margin:0 auto;touch-action:none;"></div>
+      <div class="np-dialog-actions" style="margin-top:8px;">
+        <button class="np-ed-cancel" style="background:#2a2a2a;color:#eee;border:1px solid #444;">Cancel</button>
+        <button class="np-ed-save" style="background:#e8873a;color:#000;border:1px solid #e8873a;">Save</button>
+      </div>`;
+    // breadcrumb
+    const crumbs = box.querySelector(".np-ed-crumbs") as HTMLElement;
+    crumbs.innerHTML = `<span class="np-ec" data-d="0" style="cursor:pointer;color:#e8873a;">root</span>` +
+      path.map((_,i) => {
+        let c = working.children, s: any;
+        for (let k=0;k<=i;k++){ s = c[path[k]]; c = s.children||[]; }
+        return ` / <span class="np-ec" data-d="${i+1}" style="cursor:pointer;color:#e8873a;">${s?.label||"folder"}</span>`;
+      }).join("");
+    crumbs.querySelectorAll(".np-ec").forEach(c => c.addEventListener("click", () => { path = path.slice(0, +(c as HTMLElement).dataset.d!); editing=-1; render(); }));
 
-      box.querySelector(".np-ed-cancel")!.addEventListener("click", close);
-      box.querySelector(".np-ed-save")!.addEventListener("click", () => {
-        (window as any).__setMenuConfig(working);   // commits + saves to server
-        toast("menu saved ✓"); close();
-      });
+    box.querySelector(".np-ed-plus")!.addEventListener("click", () => {
+      if (dirs >= 10) return;
+      setDirs(dirs + 1); ensureLen(arr, dirs + 1); editing = -1; render();
+    });
+    box.querySelector(".np-ed-minus")!.addEventListener("click", () => {
+      if (dirs <= 1) return;
+      setDirs(dirs - 1);
+      arr.length = dirs - 1;   // drop the last slot
+      editing = -1; render();
+    });
+
+    const ring = box.querySelector(".np-ed-ring") as HTMLElement;
+    const R = 150, cx = 220, cy = 200;
+    // center dot
+    const dot = document.createElement("div");
+    dot.style.cssText = `position:absolute;left:${cx}px;top:${cy}px;transform:translate(-50%,-50%);width:10px;height:10px;border-radius:50%;background:#e8873a;`;
+    ring.appendChild(dot);
+
+    for (let i=0;i<dirs;i++){
+      const slot = arr[i] || { type:"empty" };
+      const ang = (i/dirs)*Math.PI*2 - Math.PI/2;
+      const x = cx + Math.cos(ang)*R, y = cy + Math.sin(ang)*R;
+      const d = document.createElement("div");
+      const isFolder = slot.type==="folder" || slot.type==="slider";
+      const col = slot.type==="color" ? slot.color : "";
+      const lbl = slotLabel(slot);
+      d.style.cssText = `position:absolute;left:${x}px;top:${y}px;transform:translate(-50%,-50%);
+        min-width:48px;max-width:80px;text-align:center;padding:6px 8px;border-radius:8px;cursor:pointer;
+        font:12px sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+        background:${col || (i===editing?'#e8873a':'rgba(40,40,40,.95)')};
+        color:${col?'#000':(i===editing?'#000':slot.type==='empty'?'#666':'#eee')};
+        border:1px solid ${i===editing?'#e8873a':'#555'};${isFolder?'font-weight:bold;':''}`;
+      d.textContent = (lbl || (slot.type==="empty"?"·":slot.type)) + (isFolder?" ▸":"");
+              d.textContent = (lbl || (slot.type==="empty"?"·":slot.type)) + (isFolder?" ▸":"");
+        d.dataset.idx = String(i);
+
+                d.textContent = (lbl || (slot.type==="empty"?"·":slot.type)) + (isFolder?" ▸":"");
+
+        let dragging = false, startX = 0, startY = 0, moved = false;
+        d.addEventListener("pointerdown", (ev) => {
+          ev.preventDefault(); ev.stopPropagation();
+          dragging = true; moved = false;
+          startX = ev.clientX; startY = ev.clientY;
+          d.setPointerCapture(ev.pointerId);
+          d.style.zIndex = "20"; d.style.opacity = "0.85";
+        });
+        d.addEventListener("pointermove", (ev) => {
+          if (!dragging) return;
+          const dxm = ev.clientX - startX, dym = ev.clientY - startY;
+          if (Math.hypot(dxm, dym) > 5) moved = true;
+          if (moved) { d.style.left = (x + dxm) + "px"; d.style.top = (y + dym) + "px"; }
+        });
+        d.addEventListener("pointerup", (ev) => {
+          if (!dragging) return;
+          dragging = false;
+          try { d.releasePointerCapture(ev.pointerId); } catch {}
+          d.style.zIndex = ""; d.style.opacity = "";
+          if (!moved) { editing = (editing===i?-1:i); render(); return; }
+          // drop target: nearest OTHER slot center to the drop point (ring-local coords)
+          const rect = ring.getBoundingClientRect();
+          const dropX = ev.clientX - rect.left, dropY = ev.clientY - rect.top;
+          let target = -1, bestD = 70;
+          for (let j=0;j<dirs;j++){
+            if (j === i) continue;
+            const a = (j/dirs)*Math.PI*2 - Math.PI/2;
+            const jx = cx + Math.cos(a)*R, jy = cy + Math.sin(a)*R;
+            const dd = Math.hypot(dropX-jx, dropY-jy);
+            if (dd < bestD){ bestD = dd; target = j; }
+          }
+          console.log("drop i=", i, "target=", target, "bestD=", bestD.toFixed(0));
+          if (target >= 0){
+            const tmp = arr[i]; arr[i] = arr[target]; arr[target] = tmp;
+          }
+          editing = -1; render();
+        });
+      ring.appendChild(d);
+    }
+
+    // if a slot is being edited, show its popover
+    if (editing >= 0) {
+      const ang = (editing/dirs)*Math.PI*2 - Math.PI/2;
+      openPopover(editing, cx + Math.cos(ang)*R, cy + Math.sin(ang)*R);
+    }
+
+    box.querySelector(".np-ed-cancel")!.addEventListener("click", close);
+    box.querySelector(".np-ed-save")!.addEventListener("click", () => { (window as any).__setMenuConfig(working); toast("menu saved ✓"); close(); });
+  };
+
+  // popover anchored near the slot
+  const openPopover = (i: number, sx: number, sy: number) => {
+    const ring = box.querySelector(".np-ed-ring") as HTMLElement;
+    const { arr } = levelAt();
+    const slot = arr[i] || (arr[i] = { type:"empty" });
+    const old = ring.querySelector(".np-pop"); if (old) old.remove();
+    const pop = document.createElement("div");
+    pop.className = "np-pop";
+    // clamp position so it stays in view
+    const px = Math.max(10, Math.min(290, sx - 75));
+    const py = Math.max(10, Math.min(250, sy + 20));
+    pop.style.cssText = `position:absolute;left:${px}px;top:${py}px;width:170px;z-index:10;
+      background:#242424;border:1px solid #e8873a;border-radius:10px;padding:10px;font:12px sans-serif;color:#eee;box-shadow:0 4px 16px rgba(0,0,0,.5);`;
+    const cmdOpts = Object.keys(COMMANDS).map(k=>`<option value="${k}" ${slot.command===k?"selected":""}>${COMMANDS[k].label}</option>`).join("");
+    pop.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <b>Slot ${i+1}</b><span class="np-pop-x" style="cursor:pointer;color:#999;">✕</span>
+      </div>
+      <select class="np-es-type" style="width:100%;margin-bottom:8px;background:#2a2a2a;color:#eee;border:1px solid #444;border-radius:6px;padding:5px;">
+        <option value="empty" ${slot.type==="empty"?"selected":""}>empty</option>
+        <option value="command" ${slot.type==="command"?"selected":""}>command</option>
+        <option value="color" ${slot.type==="color"?"selected":""}>color</option>
+        <option value="zoom" ${slot.type==="zoom"?"selected":""}>zoom</option>
+        <option value="folder" ${slot.type==="folder"?"selected":""}>folder</option>
+        <option value="slider" ${slot.type==="slider"?"selected":""}>slider</option>
+      </select>
+      <div class="np-pop-cfg" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px;"></div>
+      <input class="np-es-label" placeholder="label" value="${slot.label||""}" style="width:100%;background:#2a2a2a;color:#eee;border:1px solid #444;border-radius:6px;padding:5px;">`;
+    ring.appendChild(pop);
+
+    const cfg = pop.querySelector(".np-pop-cfg") as HTMLElement;
+    const renderCfg = () => {
+      const t = slot.type;
+      const inp = "background:#2a2a2a;color:#eee;border:1px solid #444;border-radius:6px;padding:4px;";
+      if (t==="command") cfg.innerHTML = `<select class="np-es-cmd" style="width:100%;${inp}">${cmdOpts}</select>`;
+      else if (t==="color") cfg.innerHTML = `<input class="np-es-color" type="color" value="${slot.color||"#ffffff"}" style="width:100%;height:30px;">`;
+      else if (t==="zoom") cfg.innerHTML = `<label>Zoom %<input class="np-es-zoom" type="number" value="${(slot.zoom||1)*100}" style="width:100%;${inp}"></label>`;
+      else if (t==="folder") cfg.innerHTML = `<button class="np-es-enter" style="background:#e8873a;color:#000;border:none;border-radius:6px;padding:6px;cursor:pointer;">Edit contents →</button>`;
+      else if (t==="slider") cfg.innerHTML = `
+        <select class="np-es-prop" style="width:100%;${inp}">
+          <option value="opacity" ${slot.prop==="opacity"?"selected":""}>opacity</option>
+          <option value="strokeWidth" ${slot.prop==="strokeWidth"?"selected":""}>stroke width</option>
+          <option value="roughness" ${slot.prop==="roughness"?"selected":""}>roughness</option>
+          <option value="fontSize" ${slot.prop==="fontSize"?"selected":""}>font size</option>
+        </select>
+        <div style="display:flex;gap:4px;"><label style="flex:1;">min<input class="np-es-min" type="number" value="${slot.min??0}" style="width:100%;${inp}"></label><label style="flex:1;">max<input class="np-es-max" type="number" value="${slot.max??100}" style="width:100%;${inp}"></label></div>
+        <label>default<input class="np-es-sdef" type="number" value="${slot.sdefault??""}" placeholder="none" style="width:100%;${inp}"></label>`;
+      else cfg.innerHTML = "";
+      cfg.querySelector(".np-es-cmd")?.addEventListener("change",(e)=>{ slot.command=(e.target as HTMLSelectElement).value; });
+      cfg.querySelector(".np-es-color")?.addEventListener("input",(e)=>{ slot.color=(e.target as HTMLInputElement).value; render(); });
+      cfg.querySelector(".np-es-zoom")?.addEventListener("change",(e)=>{ slot.zoom=(+(e.target as HTMLInputElement).value||100)/100; });
+      cfg.querySelector(".np-es-enter")?.addEventListener("click",()=>{ if(!slot.children)slot.children=[]; path.push(i); editing=-1; render(); });
+      cfg.querySelector(".np-es-prop")?.addEventListener("change",(e)=>{ slot.prop=(e.target as HTMLSelectElement).value as any; });
+      cfg.querySelector(".np-es-min")?.addEventListener("change",(e)=>{ slot.min=+(e.target as HTMLInputElement).value; });
+      cfg.querySelector(".np-es-max")?.addEventListener("change",(e)=>{ slot.max=+(e.target as HTMLInputElement).value; });
+      cfg.querySelector(".np-es-sdef")?.addEventListener("change",(e)=>{ const val=(e.target as HTMLInputElement).value; slot.sdefault = val===""?null:+val; });
     };
+    renderCfg();
+    pop.querySelector(".np-pop-x")!.addEventListener("click",()=>{ editing=-1; render(); });
+    (pop.querySelector(".np-es-type") as HTMLSelectElement).addEventListener("change",(e)=>{ slot.type=(e.target as HTMLSelectElement).value as SlotType; if(slot.type==="folder"&&!slot.children)slot.children=[]; renderCfg(); render(); });
+    (pop.querySelector(".np-es-label") as HTMLInputElement).addEventListener("input",(e)=>{ slot.label=(e.target as HTMLInputElement).value; });
+  };
 
-    const slotLabel = (s: MenuSlot) =>
-      s.type==="empty" ? "·" :
-      s.label || (s.type==="command" ? (COMMANDS[s.command||""]?.label||s.command) :
-                  s.type==="color" ? (s.color||"color") :
-                  s.type==="zoom" ? ((s.zoom||1)*100+"%") :
-                  s.type==="folder" ? "folder" : "?");
-
-    // inline editor for one slot
-    const editSlot = (i: number) => {
-      const { arr } = levelAt();
-      const slot = arr[i] || (arr[i] = { type:"empty" });
-      const panel = box.querySelector(".np-ed-edit") as HTMLElement;
-      const cmdOpts = Object.keys(COMMANDS).map(k => `<option value="${k}" ${slot.command===k?"selected":""}>${COMMANDS[k].label}</option>`).join("");
-      panel.innerHTML = `
-        <div style="border:1px solid var(--default-border-color,#ccc);border-radius:8px;padding:8px;margin-top:6px;font-size:12px;">
-          <div style="margin-bottom:6px;">Slot ${i+1} —
-            <select class="np-es-type">
-              <option value="empty" ${slot.type==="empty"?"selected":""}>empty</option>
-              <option value="command" ${slot.type==="command"?"selected":""}>command</option>
-              <option value="color" ${slot.type==="color"?"selected":""}>color</option>
-              <option value="zoom" ${slot.type==="zoom"?"selected":""}>zoom</option>
-              <option value="folder" ${slot.type==="folder"?"selected":""}>folder</option>
-              <option value="slider" ${slot.type==="slider"?"selected":""}>slider</option>
-            </select>
-          </div>
-          <div class="np-es-config"></div>
-          <input class="np-es-label" placeholder="label (optional)" value="${slot.label||""}" style="width:100%;margin-top:6px;">
-        </div>`;
-      const cfg = panel.querySelector(".np-es-config") as HTMLElement;
-      const renderConfig = () => {
-        const t = slot.type;
-        if (t==="command") cfg.innerHTML = `Command: <select class="np-es-cmd">${cmdOpts}</select>`;
-        else if (t==="color") cfg.innerHTML = `Color: <input class="np-es-color" type="color" value="${slot.color||"#ffffff"}">`;
-        else if (t==="zoom") cfg.innerHTML = `Zoom %: <input class="np-es-zoom" type="number" value="${(slot.zoom||1)*100}" style="width:70px;">`;
-        else if (t==="folder") cfg.innerHTML = `<button class="np-es-enter">Edit folder contents →</button>`;
-        else if (t==="slider") cfg.innerHTML =
-            `Prop: <select class="np-es-prop">
-              <option value="opacity" ${slot.prop==="opacity"?"selected":""}>opacity</option>
-              <option value="strokeWidth" ${slot.prop==="strokeWidth"?"selected":""}>stroke width</option>
-              <option value="zoom" ${slot.prop==="zoom"?"selected":""}>zoom</option>
-            </select>
-            min <input class="np-es-min" type="number" value="${slot.min??0}" style="width:56px;">
-            max <input class="np-es-max" type="number" value="${slot.max??100}" style="width:56px;">`;
-        else cfg.innerHTML = "";
-        cfg.querySelector(".np-es-cmd")?.addEventListener("change", (e)=>{ slot.command = (e.target as HTMLSelectElement).value; });
-        cfg.querySelector(".np-es-color")?.addEventListener("input", (e)=>{ slot.color = (e.target as HTMLInputElement).value; });
-        cfg.querySelector(".np-es-zoom")?.addEventListener("change", (e)=>{ slot.zoom = (+(e.target as HTMLInputElement).value||100)/100; });
-        cfg.querySelector(".np-es-enter")?.addEventListener("click", ()=>{ if(!slot.children) slot.children=[]; path.push(i); render(); });
-        cfg.querySelector(".np-es-prop")?.addEventListener("change",(e)=>{ slot.prop=(e.target as HTMLSelectElement).value as any; });
-        cfg.querySelector(".np-es-min")?.addEventListener("change",(e)=>{ slot.min=+(e.target as HTMLInputElement).value; });
-        cfg.querySelector(".np-es-max")?.addEventListener("change",(e)=>{ slot.max=+(e.target as HTMLInputElement).value; });
-      };
-      renderConfig();
-      (panel.querySelector(".np-es-type") as HTMLSelectElement).addEventListener("change", (e)=>{
-        slot.type = (e.target as HTMLSelectElement).value as SlotType;
-        if (slot.type==="folder" && !slot.children) slot.children = [];
-        renderConfig(); render();   // re-render ring to reflect type change
-        setTimeout(()=>editSlot(i), 0);  // reopen editor for this slot
-      });
-      (panel.querySelector(".np-es-label") as HTMLInputElement).addEventListener("input", (e)=>{ slot.label = (e.target as HTMLInputElement).value; });
-    };
-
-    render();
-  }
+  render();
+}
 
   function renderSliderBar(x: number, v: number) {
     if (!menuEl) return;
@@ -1016,6 +1071,8 @@ export function initNotesPanel() {
 
   document.addEventListener("pointerdown", (e) => {
     if (e.pointerType !== "touch") return;
+    // ignore touches inside any dialog (editor, save, load, etc.) — let the UI handle them
+    if ((e.target as HTMLElement)?.closest(".np-dialog-backdrop")) return;
     activeTouches.add(e.pointerId);
     if (activeTouches.size > 1) { lastFingerTap = 0; return; }
     const now = performance.now();
@@ -1031,8 +1088,10 @@ export function initNotesPanel() {
 
   document.addEventListener("pointermove", (e) => {
     if (menuOpen && e.pointerType === "touch" && e.pointerId === menuPointerId) {
+      // only if NOT over a dialog
+      if ((e.target as HTMLElement)?.closest(".np-dialog-backdrop")) return;
       e.preventDefault(); e.stopPropagation();
-      menuPenMove(e.clientX, e.clientY);     // same selection logic, finger-driven
+      menuPenMove(e.clientX, e.clientY);
     }
   }, true);
 
@@ -1052,7 +1111,9 @@ let menuAnchor = { x: 0, y: 0 };            // screen px — current level's cen
 let menuStack: (MenuNode|null)[][] = [];    // levels; top is current
 let menuHighlight = -1;
 let menuDirs = 8;
-let menuSlider: { prop: string; min: number; max: number; originX: number; label: string; startValue: number } | null = null;
+let menuSlider: { prop: string; min: number; max: number; originX: number; label: string; startValue: number; pendingValue?: number } | null = null;
+let menuSliderFolder: { prop:string; min:number; max:number; myDefault:number|null; centerX:number; centerY:number; startValue:number; label:string } | null = null;
+let sliderFolderHL: { zone: string; v?: number; idx?: number; kind?: string } | null = null;
 
 const MENU_RADIUS = 90;      // px from center to slot
 const MENU_PICK_DIST = 45;   // px pen must travel to commit a direction
@@ -1072,6 +1133,8 @@ function closeMenu() {
   menuHighlight = -1;
   if (menuEl) { menuEl.remove(); menuEl = null; }
   menuSlider = null;
+  menuSliderFolder = null;
+  sliderFolderHL = null;
 }
 
 function renderMenu() {
@@ -1102,23 +1165,26 @@ function renderMenu() {
 function menuPenMove(x: number, y: number) {
   if (!menuOpen) return;
 
+  if (menuSliderFolder) {
+    sliderFolderMove(x, y);
+    return;
+  }
+
   // if already in slider mode, map horizontal position → value
-  if (menuSlider) {
-    // escape: drag back near the original menu center → cancel slider
+    if (menuSlider) {
     const distToCenter = Math.hypot(x - menuAnchor.x, y - menuAnchor.y);
     if (distToCenter < MENU_PICK_DIST) {
-      // revert to the value we had when entering, and exit slider mode
       applySliderValue(menuSlider.prop, menuSlider.startValue);
-      menuSlider = null;
-      renderMenu();   // show the ring again
-      return;
+      menuSlider = null; renderMenu(); return;
     }
     const { min, max, originX } = menuSlider;
     const BAR = 200;
-    let t = (x - originX) / BAR;
-    t = Math.max(0, Math.min(1, t));
+    let t = Math.max(0, Math.min(1, (x - originX) / BAR));
     const v = min + t * (max - min);
-    applySliderValue(menuSlider.prop, v);
+    menuSlider.pendingValue = v;              // ← track it
+    if (menuSlider.prop === "opacity" || menuSlider.prop === "zoom") {
+      applySliderValue(menuSlider.prop, v);   // live for these
+    }
     renderSliderBar(x, v);
     return;
   }
@@ -1134,26 +1200,112 @@ function menuPenMove(x: number, y: number) {
   const node = level[slot];
 
   if (node && "children" in node) {
+    // folder → descend
     const sang = (slot / menuDirs) * Math.PI*2 - Math.PI/2;
     menuAnchor = { x: menuAnchor.x + Math.cos(sang)*MENU_RADIUS, y: menuAnchor.y + Math.sin(sang)*MENU_RADIUS };
     menuStack.push(node.children);
+    menuDirs = (node as any).dirs || menuDirs;
     menuHighlight = -1;
     renderMenu();
   } else if (node && (node as any).slider) {
+    // plain slider (old path — may be unused now that sliders resolve to sliderFolder)
     const s = (node as any).slider;
-    const startValue = readSliderValue(s.prop);   // remember current value
+    const startValue = readSliderValue(s.prop);
     menuSlider = { prop: s.prop, min: s.min, max: s.max, originX: x, label: node.label, startValue };
-    renderSliderBar(x, startValue);
+    renderSliderBar(x, readSliderValue(s.prop));
+  } else if (node && (node as any).sliderFolder) {    // ← YOUR BLOCK GOES HERE
+    const sf = (node as any).sliderFolder;
+    menuSliderFolder = {
+      ...sf,
+      label: node.label,
+      centerX: menuAnchor.x, centerY: menuAnchor.y,
+      startValue: readSliderValue(sf.prop),
+    };
+    renderSliderFolder(x, y);
+    return;
   } else {
+    // leaf → highlight
     if (slot !== menuHighlight) { menuHighlight = slot; renderMenu(); }
   }
 }
 
+function sliderFolderMove(x: number, y: number) {
+  const sf = menuSliderFolder!;
+  const cx = sf.centerX, cy = sf.centerY;
+  const BAR = 220;   // horizontal bar width
+  const barL = cx - BAR/2, barR = cx + BAR/2, barY = cy - 50;  // bar sits above center
+  // bottom options
+  const opts = [
+    { label: sf.myDefault!=null ? "default "+sf.myDefault : "default —", kind:"my" },
+    { label: "exc. default", kind:"exc" },
+    { label: "↩ back", kind:"back" },
+  ];
+
+  if (y < cy) {
+    // TOP HALF → horizontal bar
+    let t = Math.max(0, Math.min(1, (x - barL) / BAR));
+    const v = sf.min + t*(sf.max - sf.min);
+    applySliderValue(sf.prop, v);
+    sliderFolderHL = { zone:"bar", v };
+  } else {
+    // BOTTOM HALF → nearest option slot
+    const n = opts.length;
+    let best = 0, bestD = Infinity;
+    for (let i=0;i<n;i++){
+      const ox = cx + (i - (n-1)/2) * 110;
+      const oy = cy + 70;
+      const d = Math.hypot(x-ox, y-oy);
+      if (d < bestD){ bestD=d; best=i; }
+    }
+    // BACK → exit slider-folder immediately, restore the ring
+    if (opts[best].kind === "back" && bestD < 60) {
+      menuSliderFolder = null;
+      sliderFolderHL = null;
+      renderMenu();   // show the parent ring again
+      return;
+    }
+    sliderFolderHL = { zone:"opt", idx: best, kind: opts[best].kind };
+  }
+  renderSliderFolder(x, y);
+}
+
+function renderSliderFolder(x: number, y: number) {
+  if (!menuEl) return;
+  const sf = menuSliderFolder!;
+  const cx = sf.centerX, cy = sf.centerY;
+  const BAR = 220, barL = cx - BAR/2, barY = cy - 50;
+  const curV = readSliderValue(sf.prop);
+  const t = Math.max(0, Math.min(1, (curV - sf.min)/(sf.max - sf.min)));
+  const inBar = sliderFolderHL?.zone === "bar";
+  let html = "";
+  // the bar
+  html += `<div style="position:absolute;left:${barL}px;top:${barY-4}px;width:${BAR}px;height:8px;border-radius:4px;background:${inBar?'#e8873a':'rgba(80,80,80,.6)'};"></div>`;
+  html += `<div style="position:absolute;left:${barL + t*BAR - 6}px;top:${barY-8}px;width:12px;height:16px;border-radius:4px;background:#e8873a;"></div>`;
+  html += `<div style="position:absolute;left:${cx}px;top:${barY-28}px;transform:translateX(-50%);font:12px sans-serif;color:#eee;background:rgba(30,30,30,.9);padding:2px 6px;border-radius:6px;">${sf.label}: ${Math.round(curV)}</div>`;
+  // bottom options
+  const opts = [ sf.myDefault!=null ? "default "+sf.myDefault : "default —", "exc. default", "↩ back" ];
+  const n = opts.length;
+  for (let i=0;i<n;i++){
+    const ox = cx + (i-(n-1)/2)*110, oy = cy + 70;
+    const hl = sliderFolderHL?.zone==="opt" && sliderFolderHL.idx===i;
+    html += `<div style="position:absolute;left:${ox}px;top:${oy}px;transform:translate(-50%,-50%);padding:4px 10px;border-radius:8px;font:12px sans-serif;white-space:nowrap;background:${hl?'#e8873a':'rgba(30,30,30,.92)'};color:${hl?'#000':'#eee'};border:1px solid ${hl?'#e8873a':'#444'};">${opts[i]}</div>`;
+  }
+  // divider line between halves
+  html += `<div style="position:absolute;left:${cx-140}px;top:${cy}px;width:280px;height:1px;background:#555;"></div>`;
+  menuEl.innerHTML = html;
+}
+
 function menuPenUp() {
   if (!menuOpen) return;
-  if (menuSlider) {
-    // value already applied live; just close
-    menuSlider = null;
+  if (menuSliderFolder) {
+    const sf = menuSliderFolder;
+    if (sliderFolderHL?.zone === "opt") {
+      if (sliderFolderHL.kind === "my" && sf.myDefault!=null) applySliderValue(sf.prop, sf.myDefault);
+      else if (sliderFolderHL.kind === "exc") applySliderValue(sf.prop, sf.startValue);
+      // "back" = do nothing
+    }
+    // if zone was "bar", the value's already applied live
+    menuSliderFolder = null; sliderFolderHL = null;
     closeMenu();
     return;
   }
