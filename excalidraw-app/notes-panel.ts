@@ -256,6 +256,7 @@ type MenuSlot = {
   min?: number;
   max?: number;
   sdefault?: number | null;   // captured standard value (Stage B)
+  optOrder?: string[];   // slider bottom-options order, e.g. ["back","my","exc"]
 };
 type MenuConfig = { dirs: number; children: MenuSlot[] };   // top level
 
@@ -290,6 +291,8 @@ const COMMANDS: Record<string, { label: string; run: () => void }> = {
   zoomFit:    { label: "Fit view", run: () => zoomFit() },
   deleteSel:  { label: "Delete selection", run: () => dispatchKey("Delete", {}) },
   editMenu: { label: "Edit menu", run: () => (window as any).__openMenuEditor?.() },
+  nextAnnotated: { label: "Next ✎", run: () => { const d = docAtViewCenter(); if (d && d.mode==="page") goToAnnotated(d, 1); } },
+  prevAnnotated: { label: "✎ Prev", run: () => { const d = docAtViewCenter(); if (d && d.mode==="page") goToAnnotated(d, -1); } },
 };
 
 // helpers
@@ -359,13 +362,12 @@ function resolveSlot(slot: MenuSlot | null): MenuNode | null {
   }
   if (slot.type === "color") return { label: slot.label || slot.color || "color", action: () => setColorCmd(slot.color!) };
   if (slot.type === "zoom")  return { label: slot.label || ((slot.zoom!*100)+"%"), action: () => setZoomCentered(slot.zoom!) };
-    if (slot.type === "slider") {
+  if (slot.type === "slider") {
     const prop = slot.prop || "opacity";
     const min = slot.min ?? 0, max = slot.max ?? 100;
-    const myDefault = slot.sdefault;
     return {
       label: slot.label || prop,
-      sliderFolder: { prop, min, max, myDefault },
+      sliderFolder: { prop, min, max, myDefault: slot.sdefault, optOrder: slot.optOrder || ["my","exc","back"] },
     } as any;
   }
   return null;
@@ -715,7 +717,9 @@ function openMenuEditor() {
           <option value="fontSize" ${slot.prop==="fontSize"?"selected":""}>font size</option>
         </select>
         <div style="display:flex;gap:4px;"><label style="flex:1;">min<input class="np-es-min" type="number" value="${slot.min??0}" style="width:100%;${inp}"></label><label style="flex:1;">max<input class="np-es-max" type="number" value="${slot.max??100}" style="width:100%;${inp}"></label></div>
-        <label>default<input class="np-es-sdef" type="number" value="${slot.sdefault??""}" placeholder="none" style="width:100%;${inp}"></label>`;
+        <label>default<input class="np-es-sdef" type="number" value="${slot.sdefault??""}" placeholder="none" style="width:100%;${inp}"></label>
+        <div style="font-size:11px;color:#999;margin-top:4px;">Bottom options (L→R):</div>
+        <div class="np-es-order" style="display:flex;gap:4px;flex-wrap:wrap;"></div>`;
       else cfg.innerHTML = "";
       cfg.querySelector(".np-es-cmd")?.addEventListener("change",(e)=>{ slot.command=(e.target as HTMLSelectElement).value; });
       cfg.querySelector(".np-es-color")?.addEventListener("input",(e)=>{ slot.color=(e.target as HTMLInputElement).value; render(); });
@@ -725,6 +729,29 @@ function openMenuEditor() {
       cfg.querySelector(".np-es-min")?.addEventListener("change",(e)=>{ slot.min=+(e.target as HTMLInputElement).value; });
       cfg.querySelector(".np-es-max")?.addEventListener("change",(e)=>{ slot.max=+(e.target as HTMLInputElement).value; });
       cfg.querySelector(".np-es-sdef")?.addEventListener("change",(e)=>{ const val=(e.target as HTMLInputElement).value; slot.sdefault = val===""?null:+val; });
+              // slider option-order editor
+      const orderDiv = cfg.querySelector(".np-es-order") as HTMLElement;
+      if (orderDiv) {
+        const names: any = { my:"default", exc:"exc", back:"back" };
+        const renderOrder = () => {
+          const ord = slot.optOrder || ["my","exc","back"];
+          orderDiv.innerHTML = ord.map((k:string,idx:number)=>
+            `<span style="background:#333;border-radius:6px;padding:2px 4px;display:inline-flex;gap:2px;align-items:center;">
+                <button data-d="-1" data-i="${idx}" style="border:none;background:none;color:#e8873a;cursor:pointer;">◄</button>
+                ${names[k]}
+                <button data-d="1" data-i="${idx}" style="border:none;background:none;color:#e8873a;cursor:pointer;">►</button>
+              </span>`).join("");
+          orderDiv.querySelectorAll("button").forEach(b=>b.addEventListener("click",(ev)=>{
+            const i2 = +(ev.target as HTMLElement).dataset.i!, d2 = +(ev.target as HTMLElement).dataset.d!;
+            const ord2 = [...(slot.optOrder||["my","exc","back"])];
+            const j = i2 + d2;
+            if (j<0||j>=ord2.length) return;
+            [ord2[i2], ord2[j]] = [ord2[j], ord2[i2]];
+            slot.optOrder = ord2; renderOrder();
+          }));
+        };
+        renderOrder();
+      }
     };
     renderCfg();
     pop.querySelector(".np-pop-x")!.addEventListener("click",()=>{ editing=-1; render(); });
@@ -1235,11 +1262,13 @@ function sliderFolderMove(x: number, y: number) {
   const BAR = 220;   // horizontal bar width
   const barL = cx - BAR/2, barR = cx + BAR/2, barY = cy - 50;  // bar sits above center
   // bottom options
-  const opts = [
-    { label: sf.myDefault!=null ? "default "+sf.myDefault : "default —", kind:"my" },
-    { label: "exc. default", kind:"exc" },
-    { label: "↩ back", kind:"back" },
-  ];
+  const order = (sf as any).optOrder || ["my","exc","back"];
+  const optMap: any = {
+    my: { label: sf.myDefault!=null ? "default "+sf.myDefault : "default —", kind:"my" },
+    exc: { label: "exc. default", kind:"exc" },
+    back: { label: "↩ back", kind:"back" },
+  };
+  const opts = order.map((k:string) => optMap[k]);
 
   if (y < cy) {
     // TOP HALF → horizontal bar
@@ -1283,7 +1312,13 @@ function renderSliderFolder(x: number, y: number) {
   html += `<div style="position:absolute;left:${barL + t*BAR - 6}px;top:${barY-8}px;width:12px;height:16px;border-radius:4px;background:#e8873a;"></div>`;
   html += `<div style="position:absolute;left:${cx}px;top:${barY-28}px;transform:translateX(-50%);font:12px sans-serif;color:#eee;background:rgba(30,30,30,.9);padding:2px 6px;border-radius:6px;">${sf.label}: ${Math.round(curV)}</div>`;
   // bottom options
-  const opts = [ sf.myDefault!=null ? "default "+sf.myDefault : "default —", "exc. default", "↩ back" ];
+  const order = (sf as any).optOrder || ["my","exc","back"];
+  const labelMap: any = {
+    my: sf.myDefault!=null ? "default "+sf.myDefault : "default —",
+    exc: "exc. default",
+    back: "↩ back",
+  };
+  const opts = order.map((k:string) => labelMap[k]);
   const n = opts.length;
   for (let i=0;i<n;i++){
     const ox = cx + (i-(n-1)/2)*110, oy = cy + 70;
@@ -2386,6 +2421,33 @@ function goToPage(doc: PdfDoc, index: number) {
   doc.rerender();
 }
 
+function annotatedPages(doc: PdfDoc): number[] {
+  const api = (window as any).notesAPI;
+  // collect page numbers from bound strokes of THIS doc — scene + stash
+  const all = [...api.getSceneElements(), ...strokeStash];
+  const pages = new Set<number>();
+  for (const e of all) {
+    if (e.customData?.docId === doc.id && e.customData?.page !== undefined) {
+      pages.add(e.customData.page);
+    }
+  }
+  return [...pages].sort((a,b)=>a-b);
+}
+
+function goToAnnotated(doc: PdfDoc, dir: 1 | -1) {
+  const pages = annotatedPages(doc);
+  if (!pages.length) { toast("no annotated pages"); return; }
+  const cur = doc.currentPage;
+  let target: number | undefined;
+  if (dir === 1) target = pages.find(p => p > cur);        // next annotated after current
+  else target = [...pages].reverse().find(p => p < cur);   // prev annotated before current
+  if (target === undefined) {
+    // wrap, or just go to the nearest end
+    target = dir === 1 ? pages[0] : pages[pages.length - 1];
+    toast(dir === 1 ? "wrapped to first" : "wrapped to last");
+  }
+  goToPage(doc, target);
+}
 
 
 
