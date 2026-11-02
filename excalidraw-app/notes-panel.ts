@@ -241,6 +241,159 @@ function listFolder(allRows: any[], prefix: string) {
   return { folders: [...folders].sort(), files: files.sort((a,b)=>a.label.localeCompare(b.label)) };
 }
 
+// ===== Menu config (data-driven) =====
+type SlotType = "empty" | "folder" | "command" | "color" | "zoom" | "slider";
+type MenuSlot = {
+  type: SlotType;
+  label?: string;
+  dirs?: number;
+  children?: MenuSlot[];
+  command?: string;
+  color?: string;
+  zoom?: number;
+  // slider:
+  prop?: "opacity" | "strokeWidth" | "zoom" | "custom";
+  min?: number;
+  max?: number;
+  sdefault?: number | null;   // captured standard value (Stage B)
+};
+type MenuConfig = { dirs: number; children: MenuSlot[] };   // top level
+
+type MenuNode =
+  | { label: string; action: () => void }
+  | { label: string; children: (MenuNode|null)[] };
+
+const COMMANDS: Record<string, { label: string; run: () => void }> = {
+  undo:   { label: "Undo",   run: () => dispatchKey("z", { ctrlKey: true }) },
+  redo:   { label: "Redo",   run: () => dispatchKey("z", { ctrlKey: true, shiftKey: true }) },
+  save:   { label: "Save",   run: () => clickRail("np-save") },
+  load:   { label: "Load",   run: () => clickRail("np-load") },
+  newNote:{ label: "New",    run: () => clickRail("np-load") }, // (new is in load dialog)
+  tags:   { label: "Tags",   run: () => clickRail("np-tag") },
+  addPdf: { label: "Add PDF/img", run: () => clickRail("np-pdf") },
+  export: { label: "Export", run: () => clickRail("np-export") },
+  compact:{ label: "Compact",run: () => clickRail("np-compact") },
+  link:   { label: "Link",   run: () => clickRail("np-link") },
+  target: { label: "Set target", run: () => clickRail("np-target") },
+  bind:   { label: "Bind to PDF", run: () => (window as any).bindSelection?.() },
+  mode:   { label: "Cycle mode", run: () => { const d = docAtViewCenter(); if (d) setMode(d, d.mode==="full"?"page":d.mode==="page"?"scroll":"full"); } },
+  nextPage:{ label: "Next page", run: () => { const d = docAtViewCenter(); if (d && d.mode==="page") goToPage(d, d.currentPage+1); } },
+  prevPage:{ label: "Prev page", run: () => { const d = docAtViewCenter(); if (d && d.mode==="page") goToPage(d, d.currentPage-1); } },
+  delPdf: { label: "Remove PDF", run: () => clickCluster("npc-delpdf") },
+  // excalidraw niceties:
+  selectTool: { label: "Select", run: () => (window as any).notesAPI.setActiveTool({ type: "selection" }) },
+  drawTool:   { label: "Draw",   run: () => (window as any).notesAPI.setActiveTool({ type: "freedraw" }) },
+  eraseTool:  { label: "Erase",  run: () => (window as any).notesAPI.setActiveTool({ type: "eraser" }) },
+  handTool:   { label: "Hand",   run: () => (window as any).notesAPI.setActiveTool({ type: "hand" }) },
+  textTool:   { label: "Text",   run: () => (window as any).notesAPI.setActiveTool({ type: "text" }) },
+  zoomFit:    { label: "Fit view", run: () => zoomFit() },
+  deleteSel:  { label: "Delete selection", run: () => dispatchKey("Delete", {}) },
+  editMenu: { label: "Edit menu", run: () => (window as any).__openMenuEditor?.() },
+};
+
+// helpers
+function dispatchKey(key: string, mods: any) {
+  const el = document.querySelector(".excalidraw") || document.body;
+  el.dispatchEvent(new KeyboardEvent("keydown", { key, code: key.length===1?"Key"+key.toUpperCase():key, bubbles: true, ...mods }));
+}
+function clickRail(id: string) { (document.getElementById(id) as HTMLElement)?.click(); }
+function clickCluster(id: string) { (document.getElementById(id) as HTMLElement)?.click(); }
+function setZoomCentered(z: number) {
+  const api = (window as any).notesAPI; const st = api.getAppState();
+  const vw = innerWidth, vh = innerHeight, oz = st.zoom.value;
+  const cx = (vw/2)/oz - st.scrollX, cy = (vh/2)/oz - st.scrollY;
+  api.updateScene({ appState: { ...st, scrollX: (vw/2)/z - cx, scrollY: (vh/2)/z - cy, zoom: { value: z } } });
+}
+function setColorCmd(c: string) {
+  const api = (window as any).notesAPI;
+  api.updateScene({ appState: { ...api.getAppState(), currentItemStrokeColor: c } });
+}
+function zoomFit() { /* optional: compute scene bounds + fit; stub for now */ setZoomCentered(1); }
+
+
+const DEFAULT_MENU: MenuConfig = {
+  dirs: 8,
+  children: [
+    { type: "command", command: "undo", label: "Undo" },
+    { type: "folder", label: "Colors", dirs: 8, children: [
+      { type: "color", color: "#ffffff", label: "white" },
+      { type: "color", color: "#e03131", label: "red" },
+      { type: "color", color: "#1971c2", label: "blue" },
+      { type: "color", color: "#2f9e44", label: "green" },
+      { type: "color", color: "#f08c00", label: "yellow" },
+      { type: "color", color: "#e64980", label: "pink" },
+      { type: "color", color: "#0c8599", label: "cyan" },
+      { type: "color", color: "#868e96", label: "gray" },
+    ]},
+    { type: "zoom", zoom: 1, label: "100%" },
+    { type: "zoom", zoom: 2, label: "200%" },
+    { type: "command", command: "mode", label: "Mode" },
+    { type: "folder", label: "Colors", dirs: 8, children: [
+      { type: "slider", label: "Opacity", prop: "opacity", min: 0, max: 100, sdefault: null },
+      { type: "slider", label: "Width", prop: "strokeWidth", min: 0, max: 2 },
+      { type: "empty" },
+      { type: "empty" },
+      { type: "empty" },
+      { type: "empty" },
+      { type: "empty" },
+      { type: "empty" },
+    ]},
+    { type: "command", command: "save", label: "Save" },
+    { type: "command", command: "redo", label: "Redo" },
+  ],
+};
+
+
+function resolveSlot(slot: MenuSlot | null): MenuNode | null {
+  if (!slot || slot.type === "empty") return null;
+  if (slot.type === "folder") {
+    const n = slot.dirs || 8;
+    const kids = (slot.children || []).slice(0, n);
+    while (kids.length < n) kids.push({ type: "empty" });
+    return { label: slot.label || "…", children: kids.map(resolveSlot) };
+  }
+  if (slot.type === "command") {
+    const c = COMMANDS[slot.command || ""];
+    return { label: slot.label || c?.label || "?", action: () => c?.run() };
+  }
+  if (slot.type === "color") return { label: slot.label || slot.color || "color", action: () => setColorCmd(slot.color!) };
+  if (slot.type === "zoom")  return { label: slot.label || ((slot.zoom!*100)+"%"), action: () => setZoomCentered(slot.zoom!) };
+    if (slot.type === "slider") {
+    return { label: slot.label || slot.prop || "slider", slider: { prop: slot.prop||"opacity", min: slot.min??0, max: slot.max??100 } } as any;
+  }
+  return null;
+}
+function currentMenuLevel(): (MenuNode|null)[] {
+  const cfg = (window as any).__getMenuConfig() as MenuConfig;
+  const n = cfg.dirs || 8;
+  const kids = cfg.children.slice(0, n);
+  while (kids.length < n) kids.push({ type: "empty" });
+  return kids.map(resolveSlot);
+}
+
+function applySliderValue(prop: string, v: number) {
+  const api = (window as any).notesAPI;
+  if (prop === "opacity") {
+    api.updateScene({ appState: { ...api.getAppState(), currentItemOpacity: Math.round(v) } });
+  }
+  else if (prop === "strokeWidth") {
+    api.setActiveTool({ type: "freedraw" });
+    const steps = [1, 2, 4];
+    const snapped = steps[Math.max(0, Math.min(2, Math.round(v)))];
+    requestAnimationFrame(() => {
+      api.updateScene({ appState: { ...api.getAppState(), currentItemStrokeWidth: snapped } });
+    });
+  }
+  else if (prop === "zoom") setZoomCentered(v);
+}
+function readSliderValue(prop: string): number {
+  const st = (window as any).notesAPI.getAppState();
+  if (prop === "opacity") return st.currentItemOpacity ?? 100;
+  if (prop === "strokeWidth") return st.currentItemStrokeWidth ?? 1;
+  if (prop === "zoom") return st.zoom.value;
+  return 0;
+}
+
 export function initNotesPanel() {
   if (document.getElementById("notes-panel")) return; // guard against double-init
 
@@ -256,6 +409,7 @@ export function initNotesPanel() {
     <button id="np-pdf"    title="Add PDF">📎</button>
     <button id="np-export" title="Export backup">⬇️</button>
     <button id="np-compact" title="Compact note">🗜️</button>
+    <button id="np-settings" title="Edit menu">⚙️</button>
   `;
   document.body.appendChild(panel);
 
@@ -313,6 +467,23 @@ export function initNotesPanel() {
     (window as any).deleteDoc = (hash: string) =>
     fetch(API_BASE + "/docdelete.php?hash=" + hash).then(r => r.json()).then(console.log)
 
+  let menuConfig: MenuConfig = DEFAULT_MENU;
+  (async () => {
+    try {
+      const r = await fetch(API_BASE + "/menuconfig.php");
+      const cfg = await r.json();
+      if (cfg && cfg.children) menuConfig = cfg;
+    } catch {}
+  })();
+  (window as any).__saveMenuConfig = async () => {
+    try { await fetch(API_BASE + "/menuconfig.php", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(menuConfig) }); } catch {}
+  };
+  (window as any).__getMenuConfig = () => menuConfig;
+  (window as any).__setMenuConfig = (c: MenuConfig) => { menuConfig = c; (window as any).__saveMenuConfig(); };
+
+  (window as any).__openMenuEditor = openMenuEditor;
+  panel.querySelector("#np-settings")!.addEventListener("click", openMenuEditor);
+
   function makeDialog(): { box: HTMLDivElement; close: () => void } {
     const backdrop = document.createElement("div");
     backdrop.className = "np-dialog-backdrop";
@@ -349,6 +520,176 @@ export function initNotesPanel() {
   let linkTarget: { note: string; ids: string[] } | null = null;
   const api = () => (window as any).notesAPI;
   const selectedIds = () => Object.keys(api().getAppState().selectedElementIds || {});
+
+  // ===== Config editor (ring layout) =====
+  function openMenuEditor() {
+    const { box, close } = makeDialog();
+    box.style.width = "420px";
+    // work on a deep copy; commit on Save
+    let working: MenuConfig = JSON.parse(JSON.stringify((window as any).__getMenuConfig()));
+    let path: number[] = [];   // indices into folders we've descended into
+
+    // get the level (children array + its dirs) at the current path
+    const levelAt = (): { arr: MenuSlot[]; dirs: number; setDirs: (n:number)=>void } => {
+      if (path.length === 0) {
+        return { arr: working.children, dirs: working.dirs, setDirs: (n)=>{ working.dirs = n; } };
+      }
+      let slot: any = working;
+      let container = working.children;
+      let dirsOwner: any = working;
+      for (const idx of path) {
+        slot = container[idx];
+        if (!slot.children) slot.children = [];
+        container = slot.children;
+        dirsOwner = slot;
+      }
+      return {
+        arr: container,
+        dirs: dirsOwner.dirs || 8,
+        setDirs: (n)=>{ dirsOwner.dirs = n; },
+      };
+    };
+
+    const ensureLen = (arr: MenuSlot[], n: number) => { while (arr.length < n) arr.push({ type: "empty" }); arr.length = Math.max(arr.length, n); };
+
+    const render = () => {
+      const { arr, dirs, setDirs } = levelAt();
+      ensureLen(arr, dirs);
+      box.innerHTML = `
+        <h3>Edit menu</h3>
+        <div class="np-ed-crumbs" style="font-size:12px;color:var(--text-secondary-color,#888);"></div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:12px;">
+          Directions: <input class="np-ed-dirs" type="number" min="1" max="10" value="${dirs}" style="width:52px;">
+        </div>
+        <div class="np-ed-ring" style="position:relative;width:360px;height:360px;margin:6px auto;"></div>
+        <div class="np-ed-edit"></div>
+        <div class="np-dialog-actions">
+          <button class="np-ed-cancel">Cancel</button>
+          <button class="np-ed-save">Save</button>
+        </div>`;
+      // breadcrumb
+      const crumbs = box.querySelector(".np-ed-crumbs") as HTMLElement;
+      crumbs.innerHTML = `<span class="np-ec" data-d="0" style="cursor:pointer;text-decoration:underline;">root</span>` +
+        path.map((idx,i) => {
+          // label of the folder at this depth
+          let c = working.children, s: any;
+          for (let k=0;k<=i;k++){ s = c[path[k]]; c = s.children||[]; }
+          return ` / <span class="np-ec" data-d="${i+1}" style="cursor:pointer;text-decoration:underline;">${s?.label||"folder"}</span>`;
+        }).join("");
+      crumbs.querySelectorAll(".np-ec").forEach(c => c.addEventListener("click", () => {
+        path = path.slice(0, +(c as HTMLElement).dataset.d!); render();
+      }));
+      // dirs input
+      (box.querySelector(".np-ed-dirs") as HTMLInputElement).addEventListener("change", (e) => {
+        let n = Math.max(1, Math.min(10, +(e.target as HTMLInputElement).value || 8));
+        setDirs(n); ensureLen(arr, n); render();
+      });
+      // ring of slots
+      const ring = box.querySelector(".np-ed-ring") as HTMLElement;
+      const R = 140, cx = 180, cy = 180;
+      for (let i=0;i<dirs;i++){
+        const slot = arr[i] || { type:"empty" };
+        const ang = (i/dirs)*Math.PI*2 - Math.PI/2;
+        const x = cx + Math.cos(ang)*R, y = cy + Math.sin(ang)*R;
+        const d = document.createElement("div");
+        const lbl = slotLabel(slot);
+        const col = slot.type==="color" ? slot.color : "";
+        d.style.cssText = `position:absolute;left:${x}px;top:${y}px;transform:translate(-50%,-50%);
+          min-width:54px;max-width:80px;text-align:center;padding:6px 8px;border-radius:8px;cursor:pointer;
+          font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+          background:${col||'rgba(120,120,120,.15)'};border:1px solid var(--default-border-color,#888);
+          ${slot.type==="folder"?'font-weight:bold;':''}`;
+        d.textContent = lbl + (slot.type==="folder"?" ▸":"");
+        d.addEventListener("click", () => editSlot(i));
+        ring.appendChild(d);
+      }
+      // center dot
+      const dot = document.createElement("div");
+      dot.style.cssText = `position:absolute;left:${cx}px;top:${cy}px;transform:translate(-50%,-50%);width:10px;height:10px;border-radius:50%;background:#e8873a;`;
+      ring.appendChild(dot);
+
+      box.querySelector(".np-ed-cancel")!.addEventListener("click", close);
+      box.querySelector(".np-ed-save")!.addEventListener("click", () => {
+        (window as any).__setMenuConfig(working);   // commits + saves to server
+        toast("menu saved ✓"); close();
+      });
+    };
+
+    const slotLabel = (s: MenuSlot) =>
+      s.type==="empty" ? "·" :
+      s.label || (s.type==="command" ? (COMMANDS[s.command||""]?.label||s.command) :
+                  s.type==="color" ? (s.color||"color") :
+                  s.type==="zoom" ? ((s.zoom||1)*100+"%") :
+                  s.type==="folder" ? "folder" : "?");
+
+    // inline editor for one slot
+    const editSlot = (i: number) => {
+      const { arr } = levelAt();
+      const slot = arr[i] || (arr[i] = { type:"empty" });
+      const panel = box.querySelector(".np-ed-edit") as HTMLElement;
+      const cmdOpts = Object.keys(COMMANDS).map(k => `<option value="${k}" ${slot.command===k?"selected":""}>${COMMANDS[k].label}</option>`).join("");
+      panel.innerHTML = `
+        <div style="border:1px solid var(--default-border-color,#ccc);border-radius:8px;padding:8px;margin-top:6px;font-size:12px;">
+          <div style="margin-bottom:6px;">Slot ${i+1} —
+            <select class="np-es-type">
+              <option value="empty" ${slot.type==="empty"?"selected":""}>empty</option>
+              <option value="command" ${slot.type==="command"?"selected":""}>command</option>
+              <option value="color" ${slot.type==="color"?"selected":""}>color</option>
+              <option value="zoom" ${slot.type==="zoom"?"selected":""}>zoom</option>
+              <option value="folder" ${slot.type==="folder"?"selected":""}>folder</option>
+              <option value="slider" ${slot.type==="slider"?"selected":""}>slider</option>
+            </select>
+          </div>
+          <div class="np-es-config"></div>
+          <input class="np-es-label" placeholder="label (optional)" value="${slot.label||""}" style="width:100%;margin-top:6px;">
+        </div>`;
+      const cfg = panel.querySelector(".np-es-config") as HTMLElement;
+      const renderConfig = () => {
+        const t = slot.type;
+        if (t==="command") cfg.innerHTML = `Command: <select class="np-es-cmd">${cmdOpts}</select>`;
+        else if (t==="color") cfg.innerHTML = `Color: <input class="np-es-color" type="color" value="${slot.color||"#ffffff"}">`;
+        else if (t==="zoom") cfg.innerHTML = `Zoom %: <input class="np-es-zoom" type="number" value="${(slot.zoom||1)*100}" style="width:70px;">`;
+        else if (t==="folder") cfg.innerHTML = `<button class="np-es-enter">Edit folder contents →</button>`;
+        else if (t==="slider") cfg.innerHTML =
+            `Prop: <select class="np-es-prop">
+              <option value="opacity" ${slot.prop==="opacity"?"selected":""}>opacity</option>
+              <option value="strokeWidth" ${slot.prop==="strokeWidth"?"selected":""}>stroke width</option>
+              <option value="zoom" ${slot.prop==="zoom"?"selected":""}>zoom</option>
+            </select>
+            min <input class="np-es-min" type="number" value="${slot.min??0}" style="width:56px;">
+            max <input class="np-es-max" type="number" value="${slot.max??100}" style="width:56px;">`;
+        else cfg.innerHTML = "";
+        cfg.querySelector(".np-es-cmd")?.addEventListener("change", (e)=>{ slot.command = (e.target as HTMLSelectElement).value; });
+        cfg.querySelector(".np-es-color")?.addEventListener("input", (e)=>{ slot.color = (e.target as HTMLInputElement).value; });
+        cfg.querySelector(".np-es-zoom")?.addEventListener("change", (e)=>{ slot.zoom = (+(e.target as HTMLInputElement).value||100)/100; });
+        cfg.querySelector(".np-es-enter")?.addEventListener("click", ()=>{ if(!slot.children) slot.children=[]; path.push(i); render(); });
+        cfg.querySelector(".np-es-prop")?.addEventListener("change",(e)=>{ slot.prop=(e.target as HTMLSelectElement).value as any; });
+        cfg.querySelector(".np-es-min")?.addEventListener("change",(e)=>{ slot.min=+(e.target as HTMLInputElement).value; });
+        cfg.querySelector(".np-es-max")?.addEventListener("change",(e)=>{ slot.max=+(e.target as HTMLInputElement).value; });
+      };
+      renderConfig();
+      (panel.querySelector(".np-es-type") as HTMLSelectElement).addEventListener("change", (e)=>{
+        slot.type = (e.target as HTMLSelectElement).value as SlotType;
+        if (slot.type==="folder" && !slot.children) slot.children = [];
+        renderConfig(); render();   // re-render ring to reflect type change
+        setTimeout(()=>editSlot(i), 0);  // reopen editor for this slot
+      });
+      (panel.querySelector(".np-es-label") as HTMLInputElement).addEventListener("input", (e)=>{ slot.label = (e.target as HTMLInputElement).value; });
+    };
+
+    render();
+  }
+
+  function renderSliderBar(x: number, v: number) {
+    if (!menuEl) return;
+    const y = menuAnchor.y;
+    const BAR = 200, ox = menuSlider!.originX;
+    const t = Math.max(0, Math.min(1, (x - ox) / BAR));
+    menuEl.innerHTML =
+      `<div style="position:absolute;left:${ox}px;top:${y-4}px;width:${BAR}px;height:8px;border-radius:4px;background:rgba(80,80,80,.6);"></div>` +
+      `<div style="position:absolute;left:${ox + t*BAR - 6}px;top:${y-8}px;width:12px;height:16px;border-radius:4px;background:#e8873a;"></div>` +
+      `<div style="position:absolute;left:${ox}px;top:${y-28}px;font:12px sans-serif;color:#eee;background:rgba(30,30,30,.9);padding:2px 6px;border-radius:6px;">${menuSlider!.label}: ${Math.round(v)}</div>`;
+  }
 
   // SAVE — popup asks for name
   function openSaveDialog() {
@@ -668,51 +1009,6 @@ export function initNotesPanel() {
     toast(`linked ${ids.length} → ${linkTarget.note}`);
   }
 
-// ===== Marking menu (stage 1: hardcoded tree, N-aware) =====
-type MenuNode =
-  | { label: string; action: () => void }            // leaf
-  | { label: string; children: (MenuNode|null)[] };    // folder (array length = N directions)
-
-const MENU_N = 8;  // directions per level (stage-1 default; configurable in stage 3)
-
-// hardcoded test tree — 8 slots at top level
-function buildTestMenu(): (MenuNode|null)[] {
-  const api = () => (window as any).notesAPI;
-  const setColor = (c: string) => () => api().updateScene({ appState: { ...api().getAppState(), currentItemStrokeColor: c } });
-  const setZoom = (z: number) => () => {
-    const st = api().getAppState();
-    api().updateScene({ appState: { ...st, zoom: { value: z } } });
-  };
-  return [
-    { label: "undo", action: () => {
-      document.querySelector(".excalidraw")?.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "z", code: "KeyZ", ctrlKey: true, bubbles: true })
-      );
-    }},
-    { label: "Colors", children: [
-      { label: "white", action: setColor("#ffffff") },
-      { label: "red",   action: setColor("#e03131") },
-      { label: "blue",  action: setColor("#1971c2") },
-      { label: "green", action: setColor("#2f9e44") },
-      { label: "yellow",action: setColor("#f08c00") },
-      { label: "pink",  action: setColor("#e64980") },
-      { label: "cyan",  action: setColor("#0c8599") },
-      { label: "gray",  action: setColor("#868e96") },
-    ]},
-    { label: "Zoom 100%", action: setZoom(1) },
-    { label: "Zoom 200%", action: setZoom(2) },
-    { label: "Mode", action: () => { const d = docAtViewCenter(); if (d) { const nx = d.mode==="full"?"page":d.mode==="page"?"scroll":"full"; setMode(d, nx as any); } } },
-    null,  // empty slot
-    { label: "Save", action: () => (document.getElementById("np-save") as HTMLElement)?.click() },
-    { label: "Redo", action: () => {
-      document.querySelector(".excalidraw")?.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "z", code: "KeyZ", ctrlKey: true, shiftKey: true, bubbles: true })
-      );
-    }},
-  ];
-}
-
-
   // menu input: finger double-tap opens AND selects (finger stays down → drag to select → lift to fire)
   let lastFingerTap = 0, lastFingerX = 0, lastFingerY = 0;
   const activeTouches = new Set<number>();
@@ -755,6 +1051,8 @@ let menuOpen = false;
 let menuAnchor = { x: 0, y: 0 };            // screen px — current level's center
 let menuStack: (MenuNode|null)[][] = [];    // levels; top is current
 let menuHighlight = -1;
+let menuDirs = 8;
+let menuSlider: { prop: string; min: number; max: number; originX: number; label: string; startValue: number } | null = null;
 
 const MENU_RADIUS = 90;      // px from center to slot
 const MENU_PICK_DIST = 45;   // px pen must travel to commit a direction
@@ -762,7 +1060,9 @@ const MENU_PICK_DIST = 45;   // px pen must travel to commit a direction
 function openMenu(x: number, y: number) {
   menuOpen = true;
   menuAnchor = { x, y };
-  menuStack = [buildTestMenu()];
+  const cfg = (window as any).__getMenuConfig() as MenuConfig;
+  menuDirs = cfg?.dirs || 8;           // ← top-level direction count
+  menuStack = [currentMenuLevel()];
   menuHighlight = -1;
   renderMenu();
 }
@@ -771,6 +1071,7 @@ function closeMenu() {
   menuStack = [];
   menuHighlight = -1;
   if (menuEl) { menuEl.remove(); menuEl = null; }
+  menuSlider = null;
 }
 
 function renderMenu() {
@@ -782,9 +1083,9 @@ function renderMenu() {
   const level = menuStack[menuStack.length - 1];
   const cx = menuAnchor.x, cy = menuAnchor.y;
   let html = `<div style="position:absolute; left:${cx}px; top:${cy}px; width:8px; height:8px; margin:-4px; border-radius:50%; background:#e8873a;"></div>`;
-  for (let i = 0; i < MENU_N; i++) {
+  for (let i = 0; i < menuDirs; i++) {
     const node = level[i];
-    const ang = (i / MENU_N) * Math.PI * 2 - Math.PI/2;  // slot 0 = up
+    const ang = (i / menuDirs) * Math.PI * 2 - Math.PI/2;  // slot 0 = up
     const sx = cx + Math.cos(ang) * MENU_RADIUS;
     const sy = cy + Math.sin(ang) * MENU_RADIUS;
     const isFolder = node && "children" in node;
@@ -800,35 +1101,66 @@ function renderMenu() {
 
 function menuPenMove(x: number, y: number) {
   if (!menuOpen) return;
+
+  // if already in slider mode, map horizontal position → value
+  if (menuSlider) {
+    // escape: drag back near the original menu center → cancel slider
+    const distToCenter = Math.hypot(x - menuAnchor.x, y - menuAnchor.y);
+    if (distToCenter < MENU_PICK_DIST) {
+      // revert to the value we had when entering, and exit slider mode
+      applySliderValue(menuSlider.prop, menuSlider.startValue);
+      menuSlider = null;
+      renderMenu();   // show the ring again
+      return;
+    }
+    const { min, max, originX } = menuSlider;
+    const BAR = 200;
+    let t = (x - originX) / BAR;
+    t = Math.max(0, Math.min(1, t));
+    const v = min + t * (max - min);
+    applySliderValue(menuSlider.prop, v);
+    renderSliderBar(x, v);
+    return;
+  }
+
   const dx = x - menuAnchor.x, dy = y - menuAnchor.y;
   const dist = Math.hypot(dx, dy);
   if (dist < MENU_PICK_DIST) { menuHighlight = -1; renderMenu(); return; }
 
   let ang = Math.atan2(dy, dx) + Math.PI/2;
   ang = (ang + Math.PI*2) % (Math.PI*2);
-  const slot = Math.round(ang / (Math.PI*2) * MENU_N) % MENU_N;
+  const slot = Math.round(ang / (Math.PI*2) * menuDirs) % menuDirs;
   const level = menuStack[menuStack.length - 1];
   const node = level[slot];
 
   if (node && "children" in node) {
-    // FOLDER: descend immediately (continuous — no lift needed)
-    const sang = (slot / MENU_N) * Math.PI*2 - Math.PI/2;
+    const sang = (slot / menuDirs) * Math.PI*2 - Math.PI/2;
     menuAnchor = { x: menuAnchor.x + Math.cos(sang)*MENU_RADIUS, y: menuAnchor.y + Math.sin(sang)*MENU_RADIUS };
     menuStack.push(node.children);
     menuHighlight = -1;
     renderMenu();
+  } else if (node && (node as any).slider) {
+    const s = (node as any).slider;
+    const startValue = readSliderValue(s.prop);   // remember current value
+    menuSlider = { prop: s.prop, min: s.min, max: s.max, originX: x, label: node.label, startValue };
+    renderSliderBar(x, startValue);
   } else {
-    // leaf or empty: just highlight; commit happens on lift
     if (slot !== menuHighlight) { menuHighlight = slot; renderMenu(); }
   }
 }
 
 function menuPenUp() {
   if (!menuOpen) return;
+  if (menuSlider) {
+    // value already applied live; just close
+    menuSlider = null;
+    closeMenu();
+    return;
+  }
   const level = menuStack[menuStack.length - 1];
   const node = menuHighlight >= 0 ? level[menuHighlight] : null;
-  if (node && !("children" in node)) {
-    try { node.action(); } catch (e) { console.error(e); }
+  if (node && !("children" in node) && !(node as any).slider) {
+    try { (node as any).action(); } catch (e) { console.error(e); }
   }
   closeMenu();
 }
