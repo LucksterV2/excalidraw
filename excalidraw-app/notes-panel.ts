@@ -1435,10 +1435,17 @@ function menuPenUp() {
   }
 
   // wire rail
-  panel.querySelector("#np-vault")!.addEventListener("click", async () => {
+    panel.querySelector("#np-vault")!.addEventListener("click", async () => {
     try {
       const name = await openVault();
       toast("vault open: " + name);
+      // reload the wheel config now that the vault is actually open
+      try {
+        const r = await fetch(API_BASE + "/menuconfig.php");
+        const cfg = await r.json();
+        if (cfg && cfg.children) menuConfig = cfg;
+      } catch {}
+      // auto-load last note
       const last = localStorage.getItem("notes_currentName");
       if (last) {
         try {
