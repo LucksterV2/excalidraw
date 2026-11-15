@@ -39,8 +39,8 @@ export const importFromLocalStorage = () => {
   let savedState = null;
 
   try {
-    savedElements = localStorage.getItem(STORAGE_KEYS.LOCAL_STORAGE_ELEMENTS);
-    savedState = localStorage.getItem(STORAGE_KEYS.LOCAL_STORAGE_APP_STATE);
+    savedElements = null;  // LOCAL APP: ignore any localStorage scene — the vault is the source of truth
+    savedState = null;
   } catch (error: any) {
     // Unable to access localStorage
     console.error(error);

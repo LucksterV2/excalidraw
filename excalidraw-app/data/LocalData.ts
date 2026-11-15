@@ -74,6 +74,12 @@ const saveDataStateToLocalStorage = (
   elements: readonly ExcalidrawElement[],
   appState: AppState,
 ) => {
+  // LOCAL APP: scene persistence is handled by the fs-backend vault (notes/<name>.json),
+  // not browser storage. Writing full scenes here blew the localStorage quota on big
+  // notes ("Browser storage quota exceeded. Changes will not be saved"). Skipped.
+  // (IndexedDB image storage via LocalData.fileStorage is separate and still runs.)
+  return;
+
   const localStorageQuotaExceeded = appJotaiStore.get(
     localStorageQuotaExceededAtom,
   );
@@ -82,7 +88,7 @@ const saveDataStateToLocalStorage = (
 
     if (
       _appState.openSidebar?.name === DEFAULT_SIDEBAR.name &&
-      _appState.openSidebar.tab === CANVAS_SEARCH_TAB
+      _appState.openSidebar?.tab === CANVAS_SEARCH_TAB
     ) {
       _appState.openSidebar = null;
     }

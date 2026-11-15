@@ -1,11 +1,12 @@
 // excalidraw-app/notes-panel.ts
 
+import { installFsBackend, openVault, vaultIsOpen, rebuildIndexes } from "./fs-backend";
 import React, { useEffect } from "react";
 import { createRoot } from "react-dom/client";
 import { Excalidraw, ExcalidrawAPIProvider, useExcalidrawAPI } from "@excalidraw/excalidraw";
-
 import * as pdfjsLib from "pdfjs-dist";
-// pdf.js needs a worker; Vite can bundle it via URL:
+
+installFsBackend();
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
   import.meta.url,
@@ -14,7 +15,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
 
 
 // In dev, call the live PHP directly; in production, same-origin.
-const API_BASE = import.meta.env.DEV ? "https://notes.nodanio.dk" : "";
+const API_BASE = "";
 
 async function saveNote(name: string) {
   const api = (window as any).notesAPI;
@@ -314,6 +315,8 @@ function setColorCmd(c: string) {
 }
 function zoomFit() { /* optional: compute scene bounds + fit; stub for now */ setZoomCentered(1); }
 
+(window as any).__openVault = openVault;
+(window as any).__rebuildIndexes = rebuildIndexes;
 
 const DEFAULT_MENU: MenuConfig = {
   dirs: 8,
@@ -410,6 +413,7 @@ export function initNotesPanel() {
   panel.id = "notes-panel";
   panel.innerHTML = `
     <button id="np-toggle" title="Toggle">›</button>
+    <button id="np-vault" title="Open vault folder">📁</button>
     <button id="np-save"   title="Save">💾</button>
     <button id="np-load"   title="Load">📂</button>
     <button id="np-target" title="Set target">🎯</button>
@@ -509,7 +513,7 @@ export function initNotesPanel() {
   }
 
   (window as any).__setCurrentName = (n: string) => { setCurrentName(n); lastSavedSig = sceneSignature(); };
-  let currentName = localStorage.getItem("notes_currentName") || "";
+  let currentName = "";
   function setCurrentName(name: string) {
     currentName = name;
     if (name) localStorage.setItem("notes_currentName", name);
@@ -1431,6 +1435,22 @@ function menuPenUp() {
   }
 
   // wire rail
+  panel.querySelector("#np-vault")!.addEventListener("click", async () => {
+    try {
+      const name = await openVault();
+      toast("vault open: " + name);
+      const last = localStorage.getItem("notes_currentName");
+      if (last) {
+        try {
+          await loadNote(last);
+          setCurrentName(last);
+          lastSavedSig = sceneSignature();
+          updateFlipButtons();
+          toast("reopened " + last);
+        } catch { toast("couldn't reopen last note"); }
+      }
+    } catch (e) { toast("vault open failed"); }
+  });
   panel.querySelector("#np-save")!.addEventListener("click", openSaveDialog);
   panel.querySelector("#np-load")!.addEventListener("click", openLoadDialog);
   panel.querySelector("#np-target")!.addEventListener("click", doSetTarget);
@@ -2810,3 +2830,12 @@ async function placeImage(hash: string, dataURL: string, mime: string) {
   api.updateScene({ elements: [...api.getSceneElements(), ...els] });
 }
 
+// force dark theme on boot (we don't persist appState, so it would default to light)
+(function forceDark() {
+  const api = (window as any).notesAPI;
+  if (api?.updateScene) {
+    try { api.updateScene({ appState: { ...api.getAppState(), theme: "dark" } }); } catch {}
+  } else {
+    setTimeout(forceDark, 100);
+  }
+})();
