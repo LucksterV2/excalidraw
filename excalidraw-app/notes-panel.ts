@@ -500,6 +500,19 @@ export function initNotesPanel() {
   (window as any).__openMenuEditor = openMenuEditor;
   panel.querySelector("#np-settings")!.addEventListener("click", openMenuEditor);
 
+  (window as any).__listAutosaves = async (name?: string) => {
+    const n = name || currentName;
+    const rows = await (await fetch(API_BASE + "/autosaves.php?name=" + encodeURIComponent(n))).json();
+    console.table((rows||[]).map((r:any)=>({ id:r.id, when:new Date(r.saved_at).toLocaleString(), KB:(r.size/1024).toFixed(0) })));
+    return rows;
+  };
+  (window as any).__restoreAutosave = async (id: number, name?: string) => {
+    const n = name || currentName;
+    const v = await (await fetch(API_BASE + "/autosaves.php?name=" + encodeURIComponent(n) + "&id=" + id)).json();
+    await loadScene(JSON.parse(v.json));
+    toast("restored autosave from " + new Date(v.saved_at).toLocaleString());
+  };
+
   function makeDialog(): { box: HTMLDivElement; close: () => void } {
     const backdrop = document.createElement("div");
     backdrop.className = "np-dialog-backdrop";
@@ -521,15 +534,24 @@ export function initNotesPanel() {
   }
 
   let lastSavedSig = "";
+  let recentAutosaveSigs: string[] = [];
   function sceneSignature(): string {
     const a = (window as any).notesAPI;
     return JSON.stringify(a.getSceneElements().map((e: any) => [e.id, e.x, e.y, e.version]));
   }
-  async function doAutosave() {
+    async function doAutosave() {
     if (!currentName || loadLock || saveInFlight) return;
     const sig = sceneSignature();
-    if (sig === lastSavedSig) return;
-    try { await saveNote(currentName + "__autosave"); lastSavedSig = sig; } catch {}
+    if (sig === lastSavedSig) return;                       // nothing changed since last check
+    const api = (window as any).notesAPI;
+    if (api.getSceneElements().length + strokeStash.length === 0) return; // never autosave an empty scene over real work
+    if (recentAutosaveSigs.includes(sig)) { lastSavedSig = sig; return; } // identical to a recent autosave → don't duplicate
+    try {
+      await saveNote(currentName + "__autosave");
+      lastSavedSig = sig;
+      recentAutosaveSigs.push(sig);
+      if (recentAutosaveSigs.length > 15) recentAutosaveSigs.shift();     // keep the sig-list in step with the 15 kept files
+    } catch {}
   }
   setInterval(doAutosave, 20000);
 
@@ -1360,16 +1382,32 @@ function menuPenUp() {
     const { box, close } = makeDialog();
     box.innerHTML = `
       <h3>History — ${noteName}</h3>
-      <div style="font-size:12px;color:var(--text-secondary-color,#888)">Preview is read-only. "Restore" replaces the current note (and that itself is backed up).</div>
+      <div style="display:flex;gap:6px;margin-bottom:6px;">
+        <button class="np-h-tab" data-src="versions" style="padding:4px 10px;border-radius:6px;border:1px solid var(--default-border-color,#ccc);background:var(--button-bg,#f5f5f5);cursor:pointer;font-weight:bold;">Versions</button>
+        <button class="np-h-tab" data-src="autosaves" style="padding:4px 10px;border-radius:6px;border:1px solid var(--default-border-color,#ccc);background:var(--button-bg,#f5f5f5);cursor:pointer;">Autosaves</button>
+      </div>
+      <div style="font-size:12px;color:var(--text-secondary-color,#888)">Preview is read-only. "Restore" backs up the current note first, then replaces it.</div>
       <div class="np-dialog-list np-hist-list"></div>
       <div class="np-dialog-actions"><button class="np-h-close">Close</button></div>`;
     const list = box.querySelector(".np-hist-list") as HTMLDivElement;
     box.querySelector(".np-h-close")!.addEventListener("click", close);
+    let src = "versions";
 
-    (async () => {
-      const rows = await (await fetch(API_BASE + "/versions.php?name=" + encodeURIComponent(noteName))).json();
+    const epList = () => src === "versions"
+      ? "/versions.php?name=" + encodeURIComponent(noteName)
+      : "/autosaves.php?name=" + encodeURIComponent(noteName);
+    const epOne = (id: number) => src === "versions"
+      ? "/versions.php?id=" + id
+      : "/autosaves.php?name=" + encodeURIComponent(noteName) + "&id=" + id;
+
+    const render = async () => {
+      list.innerHTML = `<div class="np-item" style="color:var(--text-secondary-color,#888)">loading…</div>`;
+      const rows = await (await fetch(API_BASE + epList())).json();
       list.innerHTML = "";
-      if (!rows.length) { list.innerHTML = `<div class="np-item" style="color:var(--text-secondary-color,#888)">no saved versions yet</div>`; return; }
+      if (!rows || !rows.length) {
+        list.innerHTML = `<div class="np-item" style="color:var(--text-secondary-color,#888)">nothing here yet</div>`;
+        return;
+      }
       for (const row of rows) {
         const item = document.createElement("div");
         item.className = "np-item";
@@ -1381,15 +1419,15 @@ function menuPenUp() {
         const prev = document.createElement("button");
         prev.textContent = "👁 preview"; prev.style.cssText = "border:none;background:none;cursor:pointer;font-size:12px;";
         prev.addEventListener("click", async () => {
-          const v = await (await fetch(API_BASE + "/versions.php?id=" + row.id)).json();
-          openVersionPopup(noteName, JSON.parse(v.json), row.id);  // read-only popup
+          const v = await (await fetch(API_BASE + epOne(row.id))).json();
+          openVersionPopup(noteName, JSON.parse(v.json), row.id);
         });
         const rest = document.createElement("button");
         rest.textContent = "↺ restore"; rest.style.cssText = "border:none;background:none;cursor:pointer;font-size:12px;color:#e8873a;";
         rest.addEventListener("click", async () => {
           if (loadLock || saveInFlight) { toast("busy — wait a moment"); return; }
-          if (!confirm(`Restore the version from ${when}? Your current note will be backed up first, then replaced.`)) return;
-          const v = await (await fetch(API_BASE + "/versions.php?id=" + row.id)).json();
+          if (!confirm(`Restore the ${src === "versions" ? "version" : "autosave"} from ${when}? Your current note is backed up first, then replaced.`)) return;
+          const v = await (await fetch(API_BASE + epOne(row.id))).json();
           const scene = JSON.parse(v.json);
           await fetch(API_BASE + "/save.php", { method:"POST", headers:{"Content-Type":"application/json"},
             body: JSON.stringify({ name: noteName, json: v.json }) });
@@ -1400,7 +1438,15 @@ function menuPenUp() {
         item.appendChild(lbl); item.appendChild(prev); item.appendChild(rest);
         list.appendChild(item);
       }
-    })();
+    };
+
+    box.querySelectorAll(".np-h-tab").forEach(b => b.addEventListener("click", () => {
+      src = (b as HTMLElement).dataset.src!;
+      box.querySelectorAll(".np-h-tab").forEach(x => (x as HTMLElement).style.fontWeight = "normal");
+      (b as HTMLElement).style.fontWeight = "bold";
+      render();
+    }));
+    render();
   }
 
   function openVersionPopup(noteName: string, scene: any, versionId: number) {

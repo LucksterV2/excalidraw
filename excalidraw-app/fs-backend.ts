@@ -16,6 +16,7 @@
 //   index/docrefs.json                { hash: refcount }
 
 const VERSION_KEEP = 20;
+const AUTOSAVE_KEEP = 15;
 
 let vaultDir: FileSystemDirectoryHandle | null = null;
 
@@ -185,6 +186,55 @@ async function listVersions(name: string): Promise<{ id: number; saved_at: strin
   rows.sort((a, b) => b.id - a.id); // newest first
   return rows;
 }
+function baseNoteName(n: string): string {
+  return n.endsWith("__autosave") ? n.slice(0, -"__autosave".length) : n;
+}
+async function snapshotAutosave(autosaveName: string, json: string): Promise<void> {
+  const folder = "autosaves/" + baseNoteName(autosaveName).replace(/\//g, "__");
+  const ts = Date.now();
+  await writeFileText(folder, ts + ".json", json);
+  const dir = await getDir(folder, false);
+  if (!dir) return;
+  const files: number[] = [];
+  // @ts-ignore
+  for await (const [fn, h] of (dir as any).entries()) {
+    if (h.kind === "file" && fn.endsWith(".json")) files.push(parseInt(fn));
+  }
+  files.sort((a, b) => b - a);
+  for (const old of files.slice(AUTOSAVE_KEEP)) {
+    try { await dir.removeEntry(old + ".json"); } catch {}
+  }
+}
+async function listAutosaves(baseName: string): Promise<{id:number;saved_at:string;size:number}[]> {
+  const dir = await getDir("autosaves/" + baseName.replace(/\//g, "__"), false);
+  if (!dir) return [];
+  const rows: {id:number;saved_at:string;size:number}[] = [];
+  // @ts-ignore
+  for await (const [fn, h] of (dir as any).entries()) {
+    if (h.kind === "file" && fn.endsWith(".json")) {
+      const ts = parseInt(fn);
+      const f = await (h as FileSystemFileHandle).getFile();
+      rows.push({ id: ts, saved_at: new Date(ts).toISOString(), size: f.size });
+    }
+  }
+  rows.sort((a,b)=>b.id-a.id);
+  return rows;
+}
+async function getAutosave(baseName: string, id: number) {
+  const txt = await readFileText("autosaves/" + baseName.replace(/\//g, "__"), id + ".json");
+  if (txt === null) return null;
+  return { id, name: baseName, json: txt, saved_at: new Date(id).toISOString() };
+}
+async function handleAutosaves(params: URLSearchParams): Promise<Response> {
+  const name = (params.get("name") || "").trim();
+  if (!name) return jsonResponse({ error: "name" }, 400);
+  if (params.has("id")) {
+    const row = await getAutosave(name, parseInt(params.get("id")!));
+    if (!row) return jsonResponse({ error: "not found" }, 404);
+    return jsonResponse(row);
+  }
+  return jsonResponse(await listAutosaves(name));
+}
 async function getVersion(id: number): Promise<{ id: number; name: string; json: string; saved_at: string } | null> {
   // id is a ts; we must find which note folder holds it. Scan version folders.
   const vroot = await getDir("versions", false);
@@ -229,9 +279,11 @@ async function handleSave(body: any): Promise<Response> {
   if (!name || !json) return jsonResponse({ error: "name and json required" }, 400);
   const { dirPath, file } = noteParts(name);
   // archive current before overwrite (non-autosave only)
-  if (!name.endsWith("__autosave")) {
+    if (!name.endsWith("__autosave")) {
     const old = await readFileText(dirPath, file);
     if (old) await archiveVersion(name, old);
+  } else {
+    await snapshotAutosave(name, json);
   }
   await writeFileText(dirPath, file, json);
   return jsonResponse({ ok: true, name, updated_at: new Date().toISOString() });
@@ -455,6 +507,7 @@ async function routeRequest(url: string, init?: RequestInit): Promise<Response> 
     case "docref.php":     return handleDocRef(params.get("hash") || "");
     case "docdelete.php":  return handleDocDelete(params.get("hash") || "");
     case "versions.php":   return handleVersions(params);
+    case "autosaves.php":  return handleAutosaves(params);
     default:
       return new Response(JSON.stringify({ error: "unknown endpoint: " + file }), { status: 404 });
   }
@@ -471,7 +524,7 @@ export function installFsBackend() {
   originalFetch = window.fetch.bind(window);
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === "string" ? input : (input instanceof URL ? input.href : (input as Request).url);
-    if (url.includes(API_HOST_MARKER) || /\/(save|load|search|tagsave|tagsearch|linksave|rename|notedelete|menuconfig|imgsave|imgload|docsave|docload|docref|docdelete|versions)\.php/.test(url)) {
+    if (url.includes(API_HOST_MARKER) || /\/(save|load|search|tagsave|tagsearch|linksave|rename|notedelete|menuconfig|imgsave|imgload|docsave|docload|docref|docdelete|versions|autosaves)\.php/.test(url)) {
       if (!vaultDir) {
         return new Response(JSON.stringify({ error: "vault not opened" }), { status: 503 });
       }
