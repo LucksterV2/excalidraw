@@ -1854,30 +1854,41 @@ function ensurePopupStyles() {
   document.head.appendChild(s);
 }
 
-function PopupCanvas(props: { scene: any; targetIds: string[] }) {
+const DEBUG_POPUP_LINKS = false;
+
+function PopupCanvas(props: { scene: any; targetIds: string[]; pdfs?: any[]; onNavigate?: (note: string, ids: string[], newPopup: boolean) => void }) {
   const api = useExcalidrawAPI() as any;
-    useEffect(() => {
+  const wrapRef = React.useRef<HTMLDivElement | null>(null);
+
+  // PDF underlay for pages that have bound ink
+  useEffect(() => {
     if (!api) return;
     let cancelled = false;
+    const t = setTimeout(async () => {
+      if (cancelled) return;
+      await buildPdfBackdrops(api, props.scene.elements || [], props.pdfs || [], props.targetIds || []);
+      if (cancelled) return;
+      // re-fit to the target now that backdrops exist
+      const els = api.getSceneElements();
+      const targets = props.targetIds.length ? els.filter((el: any) => props.targetIds.includes(el.id)) : [];
+      if (targets.length) api.setViewport({ target: targets, fit: "scale-down", animation: false });
+    }, 60);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [api]);
 
+  useEffect(() => {
+    if (!api) return;
+    let cancelled = false;
     const frame = (tries = 0) => {
       if (cancelled) return;
       const st = api.getAppState();
-      if ((!st.width || !st.height) && tries < 40) {
-        requestAnimationFrame(() => frame(tries + 1));
-        return;
-      }
+      if ((!st.width || !st.height) && tries < 40) { requestAnimationFrame(() => frame(tries + 1)); return; }
       api.refresh();
-      // let refresh apply, THEN frame on the next tick
       requestAnimationFrame(() => {
         if (cancelled) return;
         const els = api.getSceneElements();
-        const targets = props.targetIds.length
-          ? els.filter((el: any) => props.targetIds.includes(el.id))
-          : els;
-        if (targets.length) {
-          api.setViewport({ target: targets, fit: "scale-down", animation: false });
-        }
+        const targets = props.targetIds.length ? els.filter((el: any) => props.targetIds.includes(el.id)) : els;
+        if (targets.length) api.setViewport({ target: targets, fit: "scale-down", animation: false });
         api.setActiveTool({ type: "hand" });
       });
     };
@@ -1885,62 +1896,127 @@ function PopupCanvas(props: { scene: any; targetIds: string[] }) {
     return () => { cancelled = true; };
   }, [api, props.targetIds]);
 
-  return React.createElement(Excalidraw, {
-    initialData: {
-      elements: props.scene.elements,
-      appState: {
-        ...props.scene.appState,
-        theme: (window as any).notesAPI?.getAppState?.().theme || "dark",
-        viewBackgroundColor: (window as any).notesAPI?.getAppState?.().viewBackgroundColor || "#121212",
+  // tap a linked stroke to navigate (view-mode: manual hit-test)
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!api || !el) return;
+    if (DEBUG_POPUP_LINKS) console.log("[popup] link listener attached");
+    let downX = 0, downY = 0, moved = false;
+    const pd = (e: PointerEvent) => { downX = e.clientX; downY = e.clientY; moved = false; };
+    const pm = (e: PointerEvent) => { if (Math.hypot(e.clientX - downX, e.clientY - downY) > 10) moved = true; };
+    const pu = (e: PointerEvent) => {
+      if (moved) { if (DEBUG_POPUP_LINKS) console.log("[popup] ignored (pan)"); return; }
+      const st = api.getAppState();
+      const z = st.zoom.value;
+      const rect = el.getBoundingClientRect();
+      const sx = (e.clientX - rect.left) / z - st.scrollX;
+      const sy = (e.clientY - rect.top) / z - st.scrollY;
+      const pad = 12 / z;                       // ~12 screen px of tolerance
+      const linked = api.getSceneElements().filter((l: any) => l.customData?.noteLink?.note);
+      let hit: any = null, hitArea = Infinity;
+      for (const l of linked) {
+        if (sx >= l.x - pad && sx <= l.x + (l.width || 0) + pad &&
+            sy >= l.y - pad && sy <= l.y + (l.height || 0) + pad) {
+          const a = (l.width || 1) * (l.height || 1);
+          if (a < hitArea) { hitArea = a; hit = l; }
+        }
+      }
+      if (DEBUG_POPUP_LINKS) console.log("[popup] tap scene=", Math.round(sx), Math.round(sy), "zoom=", z.toFixed(2), "linkedEls=", linked.length, "hit=", hit ? hit.customData.noteLink.note : null);
+      if (hit) props.onNavigate?.(hit.customData.noteLink.note, hit.customData.noteLink.ids || [], e.shiftKey);
+    };
+    el.addEventListener("pointerdown", pd, true);
+    el.addEventListener("pointermove", pm, true);
+    el.addEventListener("pointerup", pu, true);
+    return () => {
+      el.removeEventListener("pointerdown", pd, true);
+      el.removeEventListener("pointermove", pm, true);
+      el.removeEventListener("pointerup", pu, true);
+    };
+  }, [api, props.onNavigate]);
+
+  return React.createElement(
+    "div",
+    { ref: wrapRef, style: { width: "100%", height: "100%" } },
+    React.createElement(Excalidraw, {
+      initialData: {
+        elements: props.scene.elements,
+        appState: {
+          ...props.scene.appState,
+          theme: (window as any).notesAPI?.getAppState?.().theme || "dark",
+          viewBackgroundColor: (window as any).notesAPI?.getAppState?.().viewBackgroundColor || "#121212",
+        },
       },
-    },
-    viewModeEnabled: true,
-  });
+      viewModeEnabled: true,
+    }),
+  );
 }
 
 export async function openNotePopup(noteName: string, targetIds: string[] = []) {
-  let scene;
-  try {
-    const res = await fetch(API_BASE + "/load.php?name=" + encodeURIComponent(noteName));
-    if (!res.ok) throw new Error("load failed: " + res.status);
-    scene = await res.json();
-  } catch (e) { console.error(e); return; }
-
   ensurePopupStyles();
 
   const popup = document.createElement("div");
   popup.className = "note-popup";
   popup.innerHTML = `
     <div class="note-popup-bar">
-      <span class="note-popup-title"></span>
+      <span>
+        <button class="note-popup-back" title="Back" style="display:none;">←</button>
+        <span class="note-popup-title"></span>
+      </span>
       <span>
         <button class="note-popup-max" title="Open full">⤢</button>
         <button class="note-popup-close" title="Close">✕</button>
       </span>
     </div>
     <div class="note-popup-body"></div>`;
-  (popup.querySelector(".note-popup-title") as HTMLElement).textContent = noteName;
   document.body.appendChild(popup);
 
   const body = popup.querySelector(".note-popup-body") as HTMLElement;
+  const titleEl = popup.querySelector(".note-popup-title") as HTMLElement;
+  const backBtn = popup.querySelector(".note-popup-back") as HTMLElement;
   const root = createRoot(body);
-  root.render(
-    React.createElement(
-      ExcalidrawAPIProvider,
-      null,
-      React.createElement(PopupCanvas, { scene, targetIds }),
-    ),
-  );
+
+  const history: { note: string; targetIds: string[] }[] = [];
+  let current = { note: noteName, targetIds };
+  let navSeq = 0;
+
+  const onNavigate = (note: string, ids: string[], newPopup: boolean) => {
+    if (DEBUG_POPUP_LINKS) console.log("[popup] navigate ->", note, "newPopup=", newPopup, "ids=", ids.length);
+    if (newPopup) { openNotePopup(note, ids); return; }   // shift-tap → new popup
+    history.push(current);
+    render({ note, targetIds: ids });
+  };
+
+  const render = async (entry: { note: string; targetIds: string[] }) => {
+    current = entry;
+    titleEl.textContent = entry.note;
+    backBtn.style.display = history.length ? "" : "none";
+    let scene;
+    try {
+      const res = await fetch(API_BASE + "/load.php?name=" + encodeURIComponent(entry.note));
+      if (!res.ok) throw new Error("load failed: " + res.status);
+      scene = await res.json();
+    } catch (e) { console.error("[popup] render load error", e); titleEl.textContent = entry.note + " — load failed"; return; }
+    if (DEBUG_POPUP_LINKS) console.log("[popup] render loaded", entry.note, "els=", scene.elements?.length);
+    root.render(
+      React.createElement(ExcalidrawAPIProvider as any, { key: "nav" + (++navSeq) },
+      React.createElement(PopupCanvas, { scene, targetIds: entry.targetIds, pdfs: scene.pdfs, onNavigate })),
+    );
+  };
+
+  backBtn.addEventListener("click", () => {
+    if (!history.length) return;
+    render(history.pop()!);
+  });
 
   popup.querySelector(".note-popup-close")!.addEventListener("click", () => { root.unmount(); popup.remove(); });
 
   popup.querySelector(".note-popup-max")!.addEventListener("click", async () => {
-    if (loadLock || saveInFlight) { (window as any).notesAPI?.setToast?.({message:"busy — wait a moment", duration:2000}); return; }
+    if (loadLock || saveInFlight) { (window as any).notesAPI?.setToast?.({ message: "busy — wait a moment", duration: 2000 }); return; }
     root.unmount(); popup.remove();
-    await loadNote(noteName);
-    (window as any).__setCurrentName?.(noteName);
+    await loadNote(current.note);
+    (window as any).__setCurrentName?.(current.note);
     const api = (window as any).notesAPI;
-    const targets = api.getSceneElements().filter((el: any) => targetIds.includes(el.id));
+    const targets = api.getSceneElements().filter((el: any) => current.targetIds.includes(el.id));
     if (targets.length) api.setViewport({ target: targets, fit: "scale-down", animation: false });
   });
 
@@ -1948,16 +2024,11 @@ export async function openNotePopup(noteName: string, targetIds: string[] = []) 
   bar.addEventListener("pointerdown", (e) => {
     if ((e.target as HTMLElement).closest("button")) return;
     e.preventDefault();
-
     const startX = e.clientX, startY = e.clientY;
     const rect = popup.getBoundingClientRect();
-
-    // full-screen shield that captures all pointer events during the drag,
-    // so the popup's canvas can't steal the move events
     const shield = document.createElement("div");
     shield.style.cssText = "position:fixed; inset:0; z-index:9999; cursor:move;";
     document.body.appendChild(shield);
-
     const move = (ev: PointerEvent) => {
       popup.style.left = rect.left + (ev.clientX - startX) + "px";
       popup.style.top = rect.top + (ev.clientY - startY) + "px";
@@ -1971,6 +2042,93 @@ export async function openNotePopup(noteName: string, targetIds: string[] = []) 
     shield.addEventListener("pointerup", up);
     shield.setPointerCapture(e.pointerId);
   });
+
+  render(current);
+}
+
+const DEBUG_POPUP_PDF = false;
+const MAX_BACKDROP_PAGES = 12;
+const popupPdfCache = new Map<string, any>();
+
+async function loadPopupPdf(hash: string) {
+  if (popupPdfCache.has(hash)) return popupPdfCache.get(hash);
+  try {
+    const res = await fetch(API_BASE + "/docload.php?hash=" + hash);
+    if (!res.ok) throw new Error("pdf fetch " + res.status);
+    const buf = await res.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+    popupPdfCache.set(hash, pdf);
+    return pdf;
+  } catch (e) { if (DEBUG_POPUP_PDF) console.warn("[popup-pdf] load fail", hash, e); return null; }
+}
+
+function makeBackdropImageEl(fileId: string, key: string, x: number, y: number, w: number, h: number) {
+  const rnd = () => Math.floor(Math.random() * 2 ** 31);
+  return {
+    type: "image", id: "pdfbg_" + key, fileId, status: "saved",
+    x, y, width: w, height: h, angle: 0,
+    strokeColor: "transparent", backgroundColor: "transparent",
+    fillStyle: "solid", strokeWidth: 1, strokeStyle: "solid",
+    roughness: 0, opacity: 100, groupIds: [], frameId: null,
+    roundness: null, seed: rnd(), version: 1, versionNonce: rnd(),
+    isDeleted: false, boundElements: null, updated: Date.now(),
+    link: null, locked: true, scale: [1, 1], customData: { pdfBackdrop: true },
+  };
+}
+
+// Render the PDF page(s) that bound ink sits on, as locked image elements behind the strokes.
+async function buildPdfBackdrops(api: any, elements: any[], pdfs: any[], targetIds: string[]) {
+  if (!pdfs || !pdfs.length) return;
+  const docMeta = new Map(pdfs.map((d: any) => [d.id, d]));
+  const bound = (e: any) => e.customData?.docId != null && e.customData.page != null &&
+    e.customData.pageX != null && e.customData.pageY != null;
+
+  // one anchor stroke per (docId|page); prefer a stroke that's in targetIds
+  const anchors = new Map<string, { el: any; isTarget: boolean }>();
+  for (const el of elements) {
+    if (!bound(el)) continue;
+    const key = el.customData.docId + "|" + el.customData.page;
+    const isTarget = targetIds.includes(el.id);
+    const cur = anchors.get(key);
+    if (!cur || (isTarget && !cur.isTarget)) anchors.set(key, { el, isTarget });
+  }
+  let entries = [...anchors.entries()].sort((a, b) => (b[1].isTarget ? 1 : 0) - (a[1].isTarget ? 1 : 0));
+  entries = entries.slice(0, MAX_BACKDROP_PAGES);
+  if (DEBUG_POPUP_PDF) console.log("[popup-pdf] pages to render:", entries.length);
+
+  const files: any[] = [], bgEls: any[] = [];
+  for (const [key, { el }] of entries) {
+    const docId = el.customData.docId, page = el.customData.page;
+    const meta: any = docMeta.get(docId);
+    if (!meta) continue;
+    const pdf = await loadPopupPdf(meta.hash);
+    if (!pdf) continue;
+    try {
+      const pMeta = (meta.pages || []).find((p: any) => p.index === page) || { padTop: 0 };
+      const off = meta.mode === "scroll" ? (meta.scrollOffset || 0) : 0;
+      const originX = el.x - el.customData.pageX;
+      const bandTop = el.y - el.customData.pageY + off;
+      const pdfTop = bandTop + (pMeta.padTop || 0);
+      const pg = await pdf.getPage(page);
+      const vp1 = pg.getViewport({ scale: 1 });
+      const pdfW = vp1.width, pdfH = vp1.height;
+      const pageLeft = originX - pdfW / 2;
+
+      const SCALE = 2;
+      const vp = pg.getViewport({ scale: SCALE });
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.ceil(vp.width); canvas.height = Math.ceil(vp.height);
+      await pg.render({ canvas, canvasContext: canvas.getContext("2d")!, viewport: vp } as any).promise;
+      const dataURL = canvas.toDataURL("image/png");
+      const fileId = "pdfbgf_" + key.replace("|", "_");
+      files.push({ id: fileId, dataURL, mimeType: "image/png", created: Date.now() });
+      bgEls.push(makeBackdropImageEl(fileId, key.replace("|", "_"), pageLeft, pdfTop, pdfW, pdfH));
+    } catch (e) { if (DEBUG_POPUP_PDF) console.warn("[popup-pdf] render fail", key, e); }
+  }
+  if (!bgEls.length) return;
+  api.addFiles(files);
+  api.updateScene({ elements: [...bgEls, ...api.getSceneElements()] });   // prepend → behind ink
+  if (DEBUG_POPUP_PDF) console.log("[popup-pdf] injected", bgEls.length, "backdrop(s)");
 }
 
 //PDF SUPPORT
