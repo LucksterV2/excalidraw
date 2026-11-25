@@ -188,8 +188,11 @@ function teardownAllDocs() {
 }
 
 async function searchNotes(q: string) {
-  const res = await fetch(API_BASE + "/search.php?q=" + encodeURIComponent(q));
-  return res.json(); // [{name, updated_at}, ...]
+  try {
+    const res = await fetch(API_BASE + "/search.php?q=" + encodeURIComponent(q));
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];   // vault-not-open / error → empty, not a crash
+  } catch { return []; }
 }
 
 async function renameNote(oldName: string, newName: string): Promise<boolean> {

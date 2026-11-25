@@ -546,18 +546,21 @@ export function installFsBackend() {
 // development if you ever need a real outbound request to pass through.
 const EXAM_SAFE = true;
 
-// Open (or re-open) the vault folder. Call this on a user gesture (button click).
 export async function openVault(): Promise<string> {
-  // try to reuse a stored handle first
   const stored = await loadStoredHandle();
   if (stored) {
-    const perm = await (stored as any).queryPermission({ mode: "readwrite" });
-    if (perm === "granted" || (await (stored as any).requestPermission({ mode: "readwrite" })) === "granted") {
-      vaultDir = stored;
-      return stored.name;
+    try {
+      let perm = await (stored as any).queryPermission({ mode: "readwrite" });
+      if (perm !== "granted") perm = await (stored as any).requestPermission({ mode: "readwrite" });
+      if (perm === "granted") {
+        await (stored as any).getDirectoryHandle("notes", { create: true });  // verify it still resolves
+        vaultDir = stored;
+        return stored.name;
+      }
+    } catch {
+      await clearStoredHandle();   // stale/invalid → drop it and fall through to a fresh pick
     }
   }
-  // otherwise prompt
   // @ts-ignore
   const dir = await window.showDirectoryPicker({ mode: "readwrite" });
   vaultDir = dir;
@@ -601,6 +604,17 @@ async function loadStoredHandle(): Promise<FileSystemDirectoryHandle | null> {
       r.onerror = () => res(null);
     });
   } catch { return null; }
+}
+
+async function clearStoredHandle(): Promise<void> {
+  try {
+    const db = await idb();
+    await new Promise<void>((res) => {
+      const tx = db.transaction(IDB_STORE, "readwrite");
+      tx.objectStore(IDB_STORE).delete("vault");
+      tx.oncomplete = () => res(); tx.onerror = () => res();
+    });
+  } catch {}
 }
 
 // Rebuild the tags/links indexes by scanning every note (safety net / first migration).
